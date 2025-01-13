@@ -1,0 +1,59 @@
+# create a table for testing
+statement ok
+DROP TABLE IF EXISTS sales_global;
+
+statement ok
+CREATE TABLE sales_global (zip_code INT,
+          country VARCHAR(3),
+          sn INT,
+          ts TIMESTAMP,
+          currency VARCHAR(3),
+          amount FLOAT
+        ) as VALUES
+          (0, 'GRC', 0, '2022-01-01 06:00:00'::timestamp, 'EUR', 30.0),
+          (1, 'FRA', 1, '2022-01-01 08:00:00'::timestamp, 'EUR', 50.0),
+          (1, 'CHI', 1, '2022-01-01 08:00:00'::timestamp, 'EUR', 50.0),
+          (1, 'TUR', 2, '2022-01-01 11:30:00'::timestamp, 'TRY', 75.0),
+          (1, 'FRA', 3, '2022-01-02 12:00:00'::timestamp, 'EUR', 200.0),
+          (1, 'TUR', 4, '2022-01-03 10:00:00'::timestamp, 'TRY', 100.0),
+          (0, 'GRC', 4, '2022-01-03 10:00:00'::timestamp, 'EUR', 80.0)
+
+
+statement ok
+set datafusion.execution.target_partitions = 1;
+
+# If existing ordering doesn't satisfy requirement, we should do calculations
+# on naive requirement (by convention, otherwise the final plan will be unintuitive),
+# even if reverse ordering is possible.
+# hence, below query should add `SortExec(ts DESC)` to the final plan.
+query TT
+EXPLAIN SELECT country, FIRST_VALUE(amount ORDER BY ts DESC) as fv1,
+    LAST_VALUE(amount ORDER BY ts DESC) as lv1,
+    SUM(amount ORDER BY ts DESC) as sum1
+  FROM sales_global
+  GROUP BY country
+  ORDER BY country
+----
+logical_plan
+01)Sort: sales_global.country ASC NULLS LAST
+02)--Projection: sales_global.country, first_value(sales_global.amount) ORDER BY [sales_global.ts DESC NULLS FIRST] AS fv1, last_value(sales_global.amount) ORDER BY [sales_global.ts DESC NULLS FIRST] AS lv1, sum(sales_global.amount) ORDER BY [sales_global.ts DESC NULLS FIRST] AS sum1
+03)----Aggregate: groupBy=[[sales_global.country]], aggr=[[first_value(sales_global.amount) ORDER BY [sales_global.ts DESC NULLS FIRST], last_value(sales_global.amount) ORDER BY [sales_global.ts DESC NULLS FIRST], sum(CAST(sales_global.amount AS Float64)) ORDER BY [sales_global.ts DESC NULLS FIRST]]]
+04)------TableScan: sales_global projection=[country, ts, amount]
+physical_plan
+01)SortExec: expr=[country@0 ASC NULLS LAST], preserve_partitioning=[false]
+02)--ProjectionExec: expr=[country@0 as country, first_value(sales_global.amount) ORDER BY [sales_global.ts DESC NULLS FIRST]@1 as fv1, last_value(sales_global.amount) ORDER BY [sales_global.ts DESC NULLS FIRST]@2 as lv1, sum(sales_global.amount) ORDER BY [sales_global.ts DESC NULLS FIRST]@3 as sum1]
+03)----AggregateExec: mode=Single, gby=[country@0 as country], aggr=[first_value(sales_global.amount) ORDER BY [sales_global.ts DESC NULLS FIRST], last_value(sales_global.amount) ORDER BY [sales_global.ts DESC NULLS FIRST], sum(sales_global.amount) ORDER BY [sales_global.ts DESC NULLS FIRST]]
+04)------MemoryExec: partitions=1, partition_sizes=[1]
+
+query TRRR
+SELECT country, FIRST_VALUE(amount ORDER BY ts DESC) as fv1,
+    LAST_VALUE(amount ORDER BY ts DESC) as lv1,
+    SUM(amount ORDER BY ts DESC) as sum1
+  FROM sales_global
+  GROUP BY country
+  ORDER BY country
+----
+CHI 50 50 50
+FRA 200 50 250
+GRC 80 30 110
+TUR 100 75 175
