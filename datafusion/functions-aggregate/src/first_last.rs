@@ -22,7 +22,7 @@ use std::fmt::Debug;
 use std::mem::size_of_val;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, UInt32Array, UInt64Array};
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Float64Array, StructArray, UInt32Array, UInt64Array};
 use arrow::compute::{self, lexsort_to_indices, take, take_arrays, SortColumn};
 use arrow::datatypes::{DataType, Field};
 use log::debug;
@@ -214,7 +214,7 @@ pub struct FirstValueGroupsAccumulator {
     is_set: Vec<bool>,
     // Stores ordering values, of the aggregator requirement corresponding to first value
     // of the aggregator. These values are used during merging of multiple partitions.
-    orderings: Vec<Vec<ScalarValue>>,
+    orderings:Vec<Vec<ScalarValue>>,
     // Stores the applicable ordering requirement.
     ordering_req: LexOrdering,
     // Stores whether incoming data already satisfies the ordering requirement.
@@ -333,7 +333,7 @@ impl FirstValueGroupsAccumulator {
         ScalarValue::try_from(data_type).map(|first| Self {
             first: vec![ScalarValue::Null; 0],
             is_set: vec![false; 0],
-            orderings: vec![Vec::new(); 0],
+            orderings: vec![orderings; 0],
             ordering_req: ordering_req,
             requirement_satisfied: false,
             ignore_nulls: false,
@@ -357,8 +357,8 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
 
         self.first.resize(total_num_groups, ScalarValue::Null);
         self.is_set.resize(total_num_groups, false);
-        self.orderings.resize(total_num_groups, Vec::new());
         self.group_indices = group_indices.to_vec();
+        self.orderings.resize(total_num_groups, vec![ScalarValue::Null; 0]);
 
 
         // Add one to each group's counter for each non null, non
@@ -368,7 +368,6 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
             value.logical_nulls().as_ref(),
             opt_filter,
             |group_index| {
-                let group_index = group_index as usize;
                 if !self.is_set[group_index] {
                     match self.get_first_idx(values, group_index) {
                         Ok(Some(first_idx)) => {
@@ -422,7 +421,7 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
                             }
                         }
                         Ok(None) => {
-                            // Handle None case (no valid index found)
+                            println!("No valid index found");
                         }
                         Err(e) => {
                             // Handle error from get_first_idx
@@ -436,16 +435,56 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+        println!("emit_to: {:?}", emit_to);
         println!("frist: {:?}", self.first);
-        ScalarValue::iter_to_array(self.first.iter().cloned())
+        ScalarValue::iter_to_array(emit_to.take_needed(&mut self.first))
     }
+
 
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
-        todo!()
+        println!("state calling");
+
+
+        let mut res = vec![];
+        // 提取数据
+        let firsts = emit_to.take_needed(&mut self.first);
+        let orderings = emit_to.take_needed(&mut self.orderings);
+        let is_set = emit_to.take_needed(&mut self.is_set);
+
+        // 转换 firsts
+        let firsts_array = ScalarValue::iter_to_array(firsts.iter().cloned())?;
+        res.push(firsts_array);
+
+
+        // 转换 orderings（按列拆分）
+        if !orderings.is_empty() {
+            let num_columns = orderings[0].len(); // 获取列数
+            for col_idx in 0..num_columns {
+                let column_data: Vec<ScalarValue> = orderings
+                    .iter()
+                    .map(|row| row[col_idx].clone()) // 提取每行中对应列的数据
+                    .collect();
+                let column_array = ScalarValue::iter_to_array(column_data.iter().cloned())?;
+                res.push(column_array);
+            }
+        }
+
+        // 将布尔值转换为 ScalarValue::Boolean
+        let is_set_scalar_values: Vec<ScalarValue> = is_set
+            .iter()
+            .map(|&b| ScalarValue::Boolean(Some(b)))
+            .collect();
+
+        res.push(ScalarValue::iter_to_array(is_set_scalar_values.iter().cloned())?);
+
+        // 返回结果
+        Ok(res)
     }
 
+
     fn merge_batch(&mut self, values: &[ArrayRef], group_indices: &[usize], opt_filter: Option<&BooleanArray>, total_num_groups: usize) -> Result<()> {
-        todo!()
+        println!("merge batch group_indices: {:?}", group_indices);
+        self.update_batch(values, group_indices, opt_filter, total_num_groups)
     }
 
     fn size(&self) -> usize {
