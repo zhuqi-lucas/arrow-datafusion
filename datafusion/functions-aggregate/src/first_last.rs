@@ -22,22 +22,28 @@ use std::fmt::Debug;
 use std::mem::size_of_val;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Float64Array, StructArray, UInt32Array, UInt64Array};
+use crate::correlation::CorrelationGroupsAccumulator;
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, Float64Array, StructArray, UInt32Array,
+    UInt64Array,
+};
 use arrow::compute::{self, lexsort_to_indices, take, take_arrays, SortColumn};
 use arrow::datatypes::{DataType, Field};
-use log::debug;
 use datafusion_common::utils::{compare_rows, get_row_at_idx};
 use datafusion_common::{
     arrow_datafusion_err, internal_err, DataFusionError, Result, ScalarValue,
 };
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::{format_state_name, AggregateOrderSensitivity};
-use datafusion_expr::{Accumulator, AggregateUDFImpl, Documentation, EmitTo, Expr, ExprFunctionExt, GroupsAccumulator, Signature, SortExpr, Volatility};
+use datafusion_expr::{
+    Accumulator, AggregateUDFImpl, Documentation, EmitTo, Expr, ExprFunctionExt,
+    GroupsAccumulator, Signature, SortExpr, Volatility,
+};
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::accumulate::accumulate_indices;
 use datafusion_functions_aggregate_common::utils::get_sort_options;
 use datafusion_macros::user_doc;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
-use crate::correlation::CorrelationGroupsAccumulator;
+use log::debug;
 
 create_func!(FirstValue, first_value_udaf);
 
@@ -182,8 +188,11 @@ impl AggregateUDFImpl for FirstValue {
         true
     }
 
-    fn create_groups_accumulator(&self, _args: AccumulatorArgs) -> Result<Box<dyn GroupsAccumulator>> {
-        println!("FirstValue::create_groups_accumulator");
+    fn create_groups_accumulator(
+        &self,
+        _args: AccumulatorArgs,
+    ) -> Result<Box<dyn GroupsAccumulator>> {
+        debug!("FirstValue::create_groups_accumulator");
         let ordering_dtypes = _args
             .ordering_req
             .iter()
@@ -202,7 +211,9 @@ impl AggregateUDFImpl for FirstValue {
         let requirement_satisfied =
             _args.ordering_req.is_empty() || self.requirement_satisfied;
 
-        Ok(Box::new(accumulator.with_requirement_satisfied(requirement_satisfied)))
+        Ok(Box::new(
+            accumulator.with_requirement_satisfied(requirement_satisfied),
+        ))
     }
 }
 
@@ -214,7 +225,7 @@ pub struct FirstValueGroupsAccumulator {
     is_set: Vec<bool>,
     // Stores ordering values, of the aggregator requirement corresponding to first value
     // of the aggregator. These values are used during merging of multiple partitions.
-    orderings:Vec<Vec<ScalarValue>>,
+    orderings: Vec<Vec<ScalarValue>>,
     // Stores the applicable ordering requirement.
     ordering_req: LexOrdering,
     // Stores whether incoming data already satisfies the ordering requirement.
@@ -226,7 +237,11 @@ pub struct FirstValueGroupsAccumulator {
 }
 
 impl FirstValueGroupsAccumulator {
-    fn get_first_idx(&self, values: &[ArrayRef], group_index: usize) -> Result<Option<usize>> {
+    fn get_first_idx(
+        &self,
+        values: &[ArrayRef],
+        group_index: usize,
+    ) -> Result<Option<usize>> {
         let [value, ordering_values @ ..] = values else {
             return internal_err!("Empty row in FIRST_VALUE");
         };
@@ -256,21 +271,21 @@ impl FirstValueGroupsAccumulator {
             }
         }
 
-        println!("ordering_values for groups: {:?}", ordering_values);
-        println!("self ordering req: {:?}", self.ordering_req);
-        // 将 Vec<usize> 转换为 Vec<u64>
-        let group_indices_u64: Vec<u64> = group_indices.iter().map(|&x| x as u64).collect();
+        // Vec<usize> change to Vec<u64>
+        let group_indices_u64: Vec<u64> =
+            group_indices.iter().map(|&x| x as u64).collect();
 
-        // 将 Vec<u64> 转换为 UInt64Array
+        // Vec<u64> change to UInt64Array
         let group_indices_array = UInt64Array::from(group_indices_u64);
 
-        // 使用 take 提取子集
+        // take the sub set of ordering_values
         let sort_columns = ordering_values
             .iter()
             .zip(self.ordering_req.iter())
             .map(|(values, req)| {
                 // 使用 take 提取根据 group_indices 筛选的列
-                let filtered_values = take(values.as_ref(), &group_indices_array, None).unwrap();
+                let filtered_values =
+                    take(values.as_ref(), &group_indices_array, None).unwrap();
                 SortColumn {
                     values: Arc::new(filtered_values),
                     options: Some(req.options),
@@ -278,24 +293,27 @@ impl FirstValueGroupsAccumulator {
             })
             .collect::<Vec<_>>();
 
-        // 获取排序后的索引
+        // get the sorted indices
         let sorted_indices = lexsort_to_indices(&sort_columns, None)?;
 
-        // 将排序后的索引映射回原始索引
+        // get the original indices
         let original_indices: Vec<usize> = sorted_indices
             .iter()
-            .filter_map(|idx| idx.map(|i| group_indices.get(i as usize).cloned()).flatten())
+            .filter_map(|idx| {
+                idx.map(|i| group_indices.get(i as usize).cloned())
+                    .flatten()
+            })
             .collect();
 
         if self.ignore_nulls {
             for idx in original_indices {
                 if !value.is_null(idx) {
-                    return Ok(Some(idx));  // 返回原始索引
+                    return Ok(Some(idx));
                 }
             }
             Ok(None)
         } else {
-            Ok(original_indices.get(0).cloned())  // 返回第一个原始索引
+            Ok(original_indices.get(0).cloned())
         }
     }
 
@@ -311,7 +329,6 @@ impl FirstValueGroupsAccumulator {
         self
     }
 }
-
 
 impl FirstValueGroupsAccumulator {
     pub fn new() -> Self {
@@ -339,27 +356,26 @@ impl FirstValueGroupsAccumulator {
             ignore_nulls: false,
             group_indices: vec![0; 0],
         })
-
     }
 }
 
 impl GroupsAccumulator for FirstValueGroupsAccumulator {
-
-    fn update_batch(&mut self, values: &[ArrayRef], group_indices: &[usize], opt_filter: Option<&BooleanArray>, total_num_groups: usize) -> Result<()> {
-
+    fn update_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
         let [value, ordering_values @ ..] = values else {
             return internal_err!("Empty row in FIRST_VALUE");
         };
 
-
-        println!("update batch group_indices: {:?}", group_indices);
-        println!("update batch value: {:?}", value);
-
         self.first.resize(total_num_groups, ScalarValue::Null);
         self.is_set.resize(total_num_groups, false);
         self.group_indices = group_indices.to_vec();
-        self.orderings.resize(total_num_groups, vec![ScalarValue::Null; 0]);
-
+        self.orderings
+            .resize(total_num_groups, vec![ScalarValue::Null; 0]);
 
         // Add one to each group's counter for each non null, non
         // filtered value
@@ -371,8 +387,6 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
                 if !self.is_set[group_index] {
                     match self.get_first_idx(values, group_index) {
                         Ok(Some(first_idx)) => {
-                            println!("initial group_index: {:?}", group_index);
-                            println!("initial first_idx: {:?}", first_idx);
                             match get_row_at_idx(values, first_idx) {
                                 Ok(row) => self.update_with_new_row(&row, group_index),
                                 Err(e) => {
@@ -390,12 +404,9 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
                             eprintln!("Error get first idx: {:?}", e);
                         }
                     }
-                   
                 } else if !self.requirement_satisfied {
                     match self.get_first_idx(values, group_index) {
                         Ok(Some(first_idx)) => {
-                            println!("loop group_index: {:?}", group_index);
-                            println!("loop first_idx: {:?}", first_idx);
                             match get_row_at_idx(values, first_idx) {
                                 Ok(row) => {
                                     let orderings = &row[1..];
@@ -435,65 +446,62 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        println!("emit_to: {:?}", emit_to);
-        println!("frist: {:?}", self.first);
         ScalarValue::iter_to_array(emit_to.take_needed(&mut self.first))
     }
 
-
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
-        println!("state calling");
-
-
         let mut res = vec![];
-        // 提取数据
+        // get the needed values
         let firsts = emit_to.take_needed(&mut self.first);
         let orderings = emit_to.take_needed(&mut self.orderings);
         let is_set = emit_to.take_needed(&mut self.is_set);
 
-        // 转换 firsts
+        // change the needed values to ArrayRef
         let firsts_array = ScalarValue::iter_to_array(firsts.iter().cloned())?;
         res.push(firsts_array);
 
-
-        // 转换 orderings（按列拆分）
+        // change the needed values to ArrayRef
         if !orderings.is_empty() {
-            let num_columns = orderings[0].len(); // 获取列数
+            let num_columns = orderings[0].len();
             for col_idx in 0..num_columns {
-                let column_data: Vec<ScalarValue> = orderings
-                    .iter()
-                    .map(|row| row[col_idx].clone()) // 提取每行中对应列的数据
-                    .collect();
-                let column_array = ScalarValue::iter_to_array(column_data.iter().cloned())?;
+                let column_data: Vec<ScalarValue> =
+                    orderings.iter().map(|row| row[col_idx].clone()).collect();
+                let column_array =
+                    ScalarValue::iter_to_array(column_data.iter().cloned())?;
                 res.push(column_array);
             }
         }
 
-        // 将布尔值转换为 ScalarValue::Boolean
+        // change the needed values to ArrayRef
         let is_set_scalar_values: Vec<ScalarValue> = is_set
             .iter()
             .map(|&b| ScalarValue::Boolean(Some(b)))
             .collect();
 
-        res.push(ScalarValue::iter_to_array(is_set_scalar_values.iter().cloned())?);
+        res.push(ScalarValue::iter_to_array(
+            is_set_scalar_values.iter().cloned(),
+        )?);
 
-        // 返回结果
         Ok(res)
     }
 
-
-    fn merge_batch(&mut self, values: &[ArrayRef], group_indices: &[usize], opt_filter: Option<&BooleanArray>, total_num_groups: usize) -> Result<()> {
-        println!("merge batch group_indices: {:?}", group_indices);
+    fn merge_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
         self.update_batch(values, group_indices, opt_filter, total_num_groups)
     }
 
     fn size(&self) -> usize {
-       size_of_val(&self.is_set) +
-           size_of_val(&self.first) +
-           size_of_val(&self.orderings) +
-           size_of_val(&self.ordering_req) +
-           size_of_val(&self.requirement_satisfied) +
-           size_of_val(&self.ignore_nulls)
+        size_of_val(&self.is_set)
+            + size_of_val(&self.first)
+            + size_of_val(&self.orderings)
+            + size_of_val(&self.ordering_req)
+            + size_of_val(&self.requirement_satisfied)
+            + size_of_val(&self.ignore_nulls)
     }
 }
 
@@ -605,7 +613,6 @@ impl Accumulator for FirstValueAccumulator {
         if !self.is_set {
             if let Some(first_idx) = self.get_first_idx(values)? {
                 let row = get_row_at_idx(values, first_idx)?;
-                println!("row: {:?}", row);
                 self.update_with_new_row(&row);
             }
         } else if !self.requirement_satisfied {
@@ -876,9 +883,6 @@ impl LastValueAccumulator {
             }
         }
 
-        println!("value: {:?}", value);
-        println!("ordering_values: {:?}", ordering_values);
-
         let sort_columns = ordering_values
             .iter()
             .zip(self.ordering_req.iter())
@@ -891,8 +895,6 @@ impl LastValueAccumulator {
                 }
             })
             .collect::<Vec<_>>();
-
-        println!("sort_columns: {:?}", sort_columns);
 
         if self.ignore_nulls {
             let indices = lexsort_to_indices(&sort_columns, None)?;
@@ -927,7 +929,6 @@ impl Accumulator for LastValueAccumulator {
         if !self.is_set || self.requirement_satisfied {
             if let Some(last_idx) = self.get_last_idx(values)? {
                 let row = get_row_at_idx(values, last_idx)?;
-                println!("last update row: {:?}", row);
                 self.update_with_new_row(&row);
             }
         } else if let Some(last_idx) = self.get_last_idx(values)? {

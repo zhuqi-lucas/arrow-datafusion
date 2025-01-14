@@ -122,9 +122,6 @@ impl GroupOrderingFull {
 
         // Update state
         let max_group_index = total_num_groups - 1;
-
-        println!("current group index: {}", max_group_index);
-        println!("current state: {:?}", self.state);
         self.state = match self.state {
             State::Start => State::InProgress {
                 current: max_group_index,

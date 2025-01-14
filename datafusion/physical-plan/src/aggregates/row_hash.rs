@@ -679,8 +679,6 @@ impl Stream for GroupedHashAggregateStream {
                             }
 
                             if let Some(to_emit) = self.group_ordering.emit_to() {
-                                println!("grouping : {:?}", self.group_ordering);
-                                println!("streaming emit_to: {:?}", to_emit);
                                 timer.done();
                                 if let Some(batch) =
                                     extract_ok!(self.emit(to_emit, false))
@@ -724,8 +722,6 @@ impl Stream for GroupedHashAggregateStream {
                             }
 
                             if let Some(to_emit) = self.group_ordering.emit_to() {
-                                println!("grouping : {:?}", self.group_ordering);
-                                println!("streaming emit_to: {:?}", to_emit);
                                 timer.done();
                                 if let Some(batch) =
                                     extract_ok!(self.emit(to_emit, false))
@@ -856,19 +852,15 @@ impl GroupedHashAggregateStream {
             evaluate_optional(&self.filter_expressions, &batch)?
         };
 
-
-        println!("group_values: {:?}", group_by_values);
         for group_values in &group_by_values {
             // calculate the group indices for each input row
             let starting_num_groups = self.group_values.len();
-            println!("group_values0: {:?}", starting_num_groups);
             self.group_values
                 .intern(group_values, &mut self.current_group_indices)?;
             let group_indices = &self.current_group_indices;
 
             // Update ordering information if necessary
             let total_num_groups = self.group_values.len();
-            println!("group_values1: {:?}", total_num_groups);
             if total_num_groups > starting_num_groups {
                 self.group_ordering.new_groups(
                     group_values,
@@ -876,8 +868,6 @@ impl GroupedHashAggregateStream {
                     total_num_groups,
                 )?;
             }
-
-            println!("group_values2: {:?}", total_num_groups);
 
             // Gather the inputs to call the actual accumulator
             let t = self
@@ -909,7 +899,6 @@ impl GroupedHashAggregateStream {
                             return internal_err!("aggregate filter should be applied in partial stage, there should be no filter in final stage");
                         }
 
-                        println!("start merge batch.........");
                         // if aggregation is over intermediate states,
                         // use merge
                         acc.merge_batch(values, group_indices, None, total_num_groups)?;
@@ -959,20 +948,13 @@ impl GroupedHashAggregateStream {
             return Ok(None);
         }
 
-        println!("group_values lens: {:?}", self.group_values.len());
-        println!("emit_to: {:?}", emit_to);
-
         let mut output = self.group_values.emit(emit_to)?;
         if let EmitTo::First(n) = emit_to {
             self.group_ordering.remove_groups(n);
         }
 
-        println!("output: {:?}", output);
-
-        println!("len of accumulators: {:?}", self.accumulators.len());
         // Next output each aggregate value
         for acc in self.accumulators.iter_mut() {
-            println!("mode of aggregate: {:?}", self.mode);
             match self.mode {
                 AggregateMode::Partial => output.extend(acc.state(emit_to)?),
                 _ if spilling => {
@@ -987,19 +969,11 @@ impl GroupedHashAggregateStream {
             }
         }
 
-
-        println!("output final: {:?}", output);
-        println!("output schema: {:?}", schema);
-
         // emit reduces the memory usage. Ignore Err from update_memory_reservation. Even if it is
         // over the target memory size after emission, we can emit again rather than returning Err.
         let _ = self.update_memory_reservation();
-
-        println!("schema len: {:?}", schema.fields().len());
-        println!("output len: {:?}", output.len());
         let batch = RecordBatch::try_new(schema, output)?;
 
-        println!("emit: {:?}", batch);
         debug_assert!(batch.num_rows() > 0);
         Ok(Some(batch))
     }
