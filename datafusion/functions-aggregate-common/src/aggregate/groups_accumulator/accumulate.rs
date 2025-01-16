@@ -18,10 +18,10 @@
 //! [`GroupsAccumulator`] helpers: [`NullState`] and [`accumulate_indices`]
 //!
 //! [`GroupsAccumulator`]: datafusion_expr_common::groups_accumulator::GroupsAccumulator
-
-use arrow::array::{Array, BooleanArray, BooleanBufferBuilder, PrimitiveArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, BooleanBufferBuilder, PrimitiveArray};
 use arrow::buffer::{BooleanBuffer, NullBuffer};
 use arrow::datatypes::ArrowPrimitiveType;
+use std::sync::Arc;
 
 use datafusion_expr_common::groups_accumulator::EmitTo;
 /// Track the accumulator null state per row: if any values for that
@@ -440,6 +440,51 @@ pub fn accumulate_multiple<T, F>(
     }
 }
 
+pub fn accumulate_multiple_row<F>(
+    group_indices: &[usize],
+    value_columns: &[ArrayRef],
+    opt_filter: Option<&BooleanArray>,
+    mut value_fn: F,
+) where
+    F: FnMut(usize, usize, &[ArrayRef]) + Send,
+{
+    let combined_nulls = value_columns
+        .iter()
+        .map(|arr| arr.logical_nulls())
+        .fold(None, |acc, nulls| {
+            NullBuffer::union(acc.as_ref(), nulls.as_ref())
+        });
+
+    let valid_indices = match (combined_nulls, opt_filter) {
+        (None, None) => None,
+        (None, Some(filter)) => Some(filter.clone()),
+        (Some(nulls), None) => Some(BooleanArray::new(nulls.inner().clone(), None)),
+        (Some(nulls), Some(filter)) => {
+            let combined = nulls.inner() & filter.values();
+            Some(BooleanArray::new(combined, None))
+        }
+    };
+
+    for col in value_columns.iter() {
+        debug_assert_eq!(col.len(), group_indices.len());
+    }
+
+    match valid_indices {
+        None => {
+            for (batch_idx, &group_idx) in group_indices.iter().enumerate() {
+                value_fn(batch_idx, group_idx, value_columns);
+            }
+        }
+        Some(valid_indices) => {
+            for (batch_idx, &group_idx) in group_indices.iter().enumerate() {
+                if valid_indices.value(batch_idx) {
+                    value_fn(batch_idx, group_idx, value_columns);
+                }
+            }
+        }
+    }
+}
+
 /// This function is called to update the accumulator state per row
 /// when the value is not needed (e.g. COUNT)
 ///
@@ -571,134 +616,6 @@ pub fn accumulate_indices<F>(
                         remainder_valid_bits & remainder_filter_bits & (1 << i) != 0;
                     if is_valid {
                         index_fn(group_index)
-                    }
-                });
-        }
-    }
-}
-
-pub fn accumulate_indices_all<F>(
-    group_indices: &[usize],
-    nulls: Option<&NullBuffer>,
-    opt_filter: Option<&BooleanArray>,
-    mut index_fn: F,
-) where
-    F: FnMut(usize, &[usize]) + Send,
-{
-    match (nulls, opt_filter) {
-        (None, None) => {
-            for &group_index in group_indices.iter() {
-                index_fn(group_index, group_indices)
-            }
-        }
-        (None, Some(filter)) => {
-            debug_assert_eq!(filter.len(), group_indices.len());
-            let group_indices_chunks = group_indices.chunks_exact(64);
-            let bit_chunks = filter.values().bit_chunks();
-
-            let group_indices_remainder = group_indices_chunks.remainder();
-
-            group_indices_chunks.zip(bit_chunks.iter()).for_each(
-                |(group_index_chunk, mask)| {
-                    // index_mask has value 1 << i in the loop
-                    let mut index_mask = 1;
-                    group_index_chunk.iter().for_each(|&group_index| {
-                        // valid bit was set, real vale
-                        let is_valid = (mask & index_mask) != 0;
-                        if is_valid {
-                            index_fn(group_index, group_indices);
-                        }
-                        index_mask <<= 1;
-                    })
-                },
-            );
-
-            // handle any remaining bits (after the initial 64)
-            let remainder_bits = bit_chunks.remainder_bits();
-            group_indices_remainder
-                .iter()
-                .enumerate()
-                .for_each(|(i, &group_index)| {
-                    let is_valid = remainder_bits & (1 << i) != 0;
-                    if is_valid {
-                        index_fn(group_index, group_indices)
-                    }
-                });
-        }
-        (Some(valids), None) => {
-            debug_assert_eq!(valids.len(), group_indices.len());
-            // This is based on (ahem, COPY/PASTA) arrow::compute::aggregate::sum
-            // iterate over in chunks of 64 bits for more efficient null checking
-            let group_indices_chunks = group_indices.chunks_exact(64);
-            let bit_chunks = valids.inner().bit_chunks();
-
-            let group_indices_remainder = group_indices_chunks.remainder();
-
-            group_indices_chunks.zip(bit_chunks.iter()).for_each(
-                |(group_index_chunk, mask)| {
-                    // index_mask has value 1 << i in the loop
-                    let mut index_mask = 1;
-                    group_index_chunk.iter().for_each(|&group_index| {
-                        // valid bit was set, real vale
-                        let is_valid = (mask & index_mask) != 0;
-                        if is_valid {
-                            index_fn(group_index, group_indices);
-                        }
-                        index_mask <<= 1;
-                    })
-                },
-            );
-
-            // handle any remaining bits (after the initial 64)
-            let remainder_bits = bit_chunks.remainder_bits();
-            group_indices_remainder
-                .iter()
-                .enumerate()
-                .for_each(|(i, &group_index)| {
-                    let is_valid = remainder_bits & (1 << i) != 0;
-                    if is_valid {
-                        index_fn(group_index, group_indices)
-                    }
-                });
-        }
-
-        (Some(valids), Some(filter)) => {
-            debug_assert_eq!(filter.len(), group_indices.len());
-            debug_assert_eq!(valids.len(), group_indices.len());
-
-            let group_indices_chunks = group_indices.chunks_exact(64);
-            let valid_bit_chunks = valids.inner().bit_chunks();
-            let filter_bit_chunks = filter.values().bit_chunks();
-
-            let group_indices_remainder = group_indices_chunks.remainder();
-
-            group_indices_chunks
-                .zip(valid_bit_chunks.iter())
-                .zip(filter_bit_chunks.iter())
-                .for_each(|((group_index_chunk, valid_mask), filter_mask)| {
-                    // index_mask has value 1 << i in the loop
-                    let mut index_mask = 1;
-                    group_index_chunk.iter().for_each(|&group_index| {
-                        // valid bit was set, real vale
-                        let is_valid = (valid_mask & filter_mask & index_mask) != 0;
-                        if is_valid {
-                            index_fn(group_index, group_indices);
-                        }
-                        index_mask <<= 1;
-                    })
-                });
-
-            // handle any remaining bits (after the initial 64)
-            let remainder_valid_bits = valid_bit_chunks.remainder_bits();
-            let remainder_filter_bits = filter_bit_chunks.remainder_bits();
-            group_indices_remainder
-                .iter()
-                .enumerate()
-                .for_each(|(i, &group_index)| {
-                    let is_valid =
-                        remainder_valid_bits & remainder_filter_bits & (1 << i) != 0;
-                    if is_valid {
-                        index_fn(group_index, group_indices)
                     }
                 });
         }

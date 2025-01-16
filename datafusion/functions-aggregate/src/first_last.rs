@@ -39,7 +39,9 @@ use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Documentation, EmitTo, Expr, ExprFunctionExt,
     GroupsAccumulator, Signature, SortExpr, Volatility,
 };
-use datafusion_functions_aggregate_common::aggregate::groups_accumulator::accumulate::{accumulate_indices, accumulate_indices_all};
+use datafusion_functions_aggregate_common::aggregate::groups_accumulator::accumulate::{
+    accumulate_indices, accumulate_multiple_row,
+};
 use datafusion_functions_aggregate_common::utils::get_sort_options;
 use datafusion_macros::user_doc;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -235,7 +237,12 @@ pub struct FirstValueGroupsAccumulator {
 }
 
 impl FirstValueGroupsAccumulator {
-    fn get_first_idx(&self, values: &[ArrayRef], group_index: usize, group_indices: &[usize]) -> Result<Option<usize>> {
+    fn get_first_idx(
+        &self,
+        values: &[ArrayRef],
+        group_index: usize,
+        group_indices: &[usize],
+    ) -> Result<Option<usize>> {
         let [value, ordering_values @ ..] = values else {
             return internal_err!("Empty row in FIRST_VALUE");
         };
@@ -252,20 +259,24 @@ impl FirstValueGroupsAccumulator {
         }
 
         if self.requirement_satisfied {
-            return Ok(group_indices.iter().copied().find(|&i| {
-                !self.ignore_nulls || !value.is_null(i)
-            }));
+            return Ok(group_indices
+                .iter()
+                .copied()
+                .find(|&i| !self.ignore_nulls || !value.is_null(i)));
         }
 
         // 改进：避免重复转换
-        let group_indices_array = UInt64Array::from_iter(group_indices.iter().copied().map(|i| i as u64));
+        let group_indices_array =
+            UInt64Array::from_iter(group_indices.iter().copied().map(|i| i as u64));
 
         // 批量操作并优化排序逻辑
         let sort_columns = ordering_values
             .iter()
             .zip(&self.ordering_req)
             .map(|(values, req)| SortColumn {
-                values: Arc::new(take(values.as_ref(), &group_indices_array, None).unwrap()),
+                values: Arc::new(
+                    take(values.as_ref(), &group_indices_array, None).unwrap(),
+                ),
                 options: Some(req.options),
             })
             .collect::<Vec<_>>();
@@ -277,11 +288,10 @@ impl FirstValueGroupsAccumulator {
             .filter_map(|idx| idx.map(|i| group_indices[i as usize]))
             .collect::<Vec<_>>();
 
-        Ok(original_indices.into_iter().find(|&idx| {
-            !self.ignore_nulls || !value.is_null(idx)
-        }))
+        Ok(original_indices
+            .into_iter()
+            .find(|&idx| !self.ignore_nulls || !value.is_null(idx)))
     }
-
 
     // Updates state with the values in the given row.
     fn update_with_new_row(&mut self, row: &[ScalarValue], group_index: usize) {
@@ -332,10 +342,6 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
-        let [value, ordering_values @ ..] = values else {
-            return internal_err!("Empty row in FIRST_VALUE");
-        };
-
         self.first.resize(total_num_groups, ScalarValue::Null);
         self.is_set.resize(total_num_groups, false);
         self.orderings
@@ -343,63 +349,42 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
 
         // Add one to each group's counter for each non null, non
         // filtered value
-        accumulate_indices_all(
+        accumulate_multiple_row(
             group_indices,
-            value.logical_nulls().as_ref(),
+            values,
             opt_filter,
-            |group_index, group_indices| {
-                if !self.is_set[group_index] {
-                    match self.get_first_idx(values, group_index, group_indices) {
-                        Ok(Some(first_idx)) => {
-                            match get_row_at_idx(values, first_idx) {
-                                Ok(row) => self.update_with_new_row(&row, group_index),
-                                Err(e) => {
-                                    // Handle error from get_row_at_idx
-                                    eprintln!("Error get row at idx: {:?}", e);
+            |batch_idx, group_index, group_indices| {
+                if self.is_set[group_index] {
+                    match get_row_at_idx(values, batch_idx) {
+                        Ok(row) => {
+                            let orderings = &row[1..];
+                            match compare_rows(
+                                &self.orderings[group_index],
+                                orderings,
+                                &get_sort_options(self.ordering_req.as_ref()),
+                            ) {
+                                Ok(result) if result.is_gt() => {
+                                    self.update_with_new_row(&row, group_index);
                                 }
+                                Err(e) => {
+                                    // Handle error from compare_rows
+                                    eprintln!("Error comparing rows: {:?}", e);
+                                }
+                                _ => {}
                             }
                         }
-                        Ok(None) => {
-                            // Handle None case (no valid index found)
-                            println!("No valid index found");
-                        }
                         Err(e) => {
-                            // Handle error from get_first_idx
-                            eprintln!("Error get first idx: {:?}", e);
+                            // Handle error from get_row_at_idx
+                            eprintln!("Error: {:?}", e);
                         }
                     }
-                } else if !self.requirement_satisfied {
-                    match self.get_first_idx(values, group_index, group_indices) {
-                        Ok(Some(first_idx)) => {
-                            match get_row_at_idx(values, first_idx) {
-                                Ok(row) => {
-                                    let orderings = &row[1..];
-                                    match compare_rows(
-                                        &self.orderings[group_index],
-                                        orderings,
-                                        &get_sort_options(self.ordering_req.as_ref()),
-                                    ) {
-                                        Ok(result) if result.is_gt() => {
-                                            self.update_with_new_row(&row, group_index);
-                                        }
-                                        Err(e) => {
-                                            // Handle error from compare_rows
-                                            eprintln!("Error comparing rows: {:?}", e);
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                Err(e) => {
-                                    // Handle error from get_row_at_idx
-                                    eprintln!("Error: {:?}", e);
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            println!("No valid index found");
+                } else {
+                    match get_row_at_idx(values, batch_idx) {
+                        Ok(row) => {
+                            self.update_with_new_row(&row, group_index);
                         }
                         Err(e) => {
-                            // Handle error from get_first_idx
+                            // Handle error from get_row_at_idx
                             eprintln!("Error: {:?}", e);
                         }
                     }
