@@ -237,62 +237,6 @@ pub struct FirstValueGroupsAccumulator {
 }
 
 impl FirstValueGroupsAccumulator {
-    fn get_first_idx(
-        &self,
-        values: &[ArrayRef],
-        group_index: usize,
-        group_indices: &[usize],
-    ) -> Result<Option<usize>> {
-        let [value, ordering_values @ ..] = values else {
-            return internal_err!("Empty row in FIRST_VALUE");
-        };
-
-        // 优化：使用批量筛选代替逐行处理
-        let group_indices = group_indices
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &g)| (g == group_index).then_some(i))
-            .collect::<Vec<_>>();
-
-        if group_indices.is_empty() {
-            return Ok(None);
-        }
-
-        if self.requirement_satisfied {
-            return Ok(group_indices
-                .iter()
-                .copied()
-                .find(|&i| !self.ignore_nulls || !value.is_null(i)));
-        }
-
-        // 改进：避免重复转换
-        let group_indices_array =
-            UInt64Array::from_iter(group_indices.iter().copied().map(|i| i as u64));
-
-        // 批量操作并优化排序逻辑
-        let sort_columns = ordering_values
-            .iter()
-            .zip(&self.ordering_req)
-            .map(|(values, req)| SortColumn {
-                values: Arc::new(
-                    take(values.as_ref(), &group_indices_array, None).unwrap(),
-                ),
-                options: Some(req.options),
-            })
-            .collect::<Vec<_>>();
-
-        // 改用部分排序（如寻找最小值）
-        let sorted_indices = lexsort_to_indices(&sort_columns, None)?;
-        let original_indices = sorted_indices
-            .iter()
-            .filter_map(|idx| idx.map(|i| group_indices[i as usize]))
-            .collect::<Vec<_>>();
-
-        Ok(original_indices
-            .into_iter()
-            .find(|&idx| !self.ignore_nulls || !value.is_null(idx)))
-    }
-
     // Updates state with the values in the given row.
     fn update_with_new_row(&mut self, row: &[ScalarValue], group_index: usize) {
         self.first[group_index] = row[0].clone();
@@ -322,14 +266,13 @@ impl FirstValueGroupsAccumulator {
             .iter()
             .map(ScalarValue::try_from)
             .collect::<Result<Vec<_>>>()?;
-        let requirement_satisfied = ordering_req.is_empty();
         ScalarValue::try_from(data_type).map(|first| Self {
-            first: vec![ScalarValue::Null; 0],
+            first: vec![first; 0],
             is_set: vec![false; 0],
             orderings: vec![orderings; 0],
             ordering_req: ordering_req,
             requirement_satisfied: false,
-            ignore_nulls: false,
+            ignore_nulls: ignore_nulls,
         })
     }
 }
@@ -347,8 +290,6 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
         self.orderings
             .resize(total_num_groups, vec![ScalarValue::Null; 0]);
 
-        // Add one to each group's counter for each non null, non
-        // filtered value
         accumulate_multiple_row(
             group_indices,
             values,
