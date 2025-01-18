@@ -240,11 +240,6 @@ pub struct FirstValueGroupsAccumulator {
 impl FirstValueGroupsAccumulator {
     // Updates state with the values in the given row.
     fn update_with_new_row(&mut self, row: &[ScalarValue], group_index: usize) {
-        println!(
-            "updating with group_index: {:?} new row: {:?}",
-            group_index, row
-        );
-        println!("updating first value: {:?}", row[0].clone());
         self.first[group_index] = row[0].clone();
         self.orderings[group_index] = row[1..].to_vec();
         self.is_set[group_index] = true;
@@ -311,15 +306,6 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
             );
         }
 
-        println!(
-            "FirstValueGroupsAccumulator::update_batch: group_indices: {:?}",
-            group_indices
-        );
-        println!(
-            "FirstValueGroupsAccumulator::update_batch: values: {:?}",
-            values
-        );
-
         accumulate_multiple_row(
             group_indices,
             values,
@@ -329,7 +315,6 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
                     match get_row_at_idx(values, batch_idx) {
                         Ok(row) => {
                             let orderings = &row[1..];
-                            println!("FirstValueGroupsAccumulator::update_batch: orderings: {:?}", orderings);
                             match compare_rows(
                                 &self.orderings[group_index],
                                 orderings,
@@ -367,10 +352,6 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        println!(
-            "FirstValueGroupsAccumulator::evaluate: self.first: {:?}",
-            self.first
-        );
         ScalarValue::iter_to_array(emit_to.take_needed(&mut self.first))
     }
 
@@ -407,8 +388,6 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
             is_set_scalar_values.iter().cloned(),
         )?);
 
-        println!("FirstValueGroupsAccumulator::state: res: {:?}", res);
-
         Ok(res)
     }
 
@@ -419,14 +398,6 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
-        println!(
-            "FirstValueGroupsAccumulator::merge_batch: 数据 values: {:?}",
-            values
-        );
-        println!(
-            "FirstValueGroupsAccumulator::merge_batch: 数据 group_indices: {:?}",
-            group_indices
-        );
 
         // 如果当前长度不足，扩展长度并填充 `ScalarValue::Float64(None)`
         if self.first.len() < total_num_groups {
@@ -455,23 +426,16 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
             values,
             opt_filter,
             |batch_idx, group_index, values| {
-                println!("FirstValueGroupsAccumulator::merge_batch: group_index: {:?}, values: {:?}, batch_idx: {:?}", group_index, values, batch_idx);
                 if self.is_set[group_index] {
-                    println!("FirstValueGroupsAccumulator::merge_batch: self.is_set[group_index]: {:?}, firsts value {:?}", self.is_set[group_index], self.first[group_index]);
                     match get_row_at_idx(values, batch_idx) {
                         Ok(row) => {
-                            println!(
-                                "FirstValueGroupsAccumulator::merge_batch: row: {:?}",
-                                row
-                            );
                             let orderings = &row[1..];
-
-                            println!("FirstValueGroupsAccumulator::merge_batch: orderings: {:?} 和 self.orderings: {:?}, ordering_req {:?}", orderings, self.orderings[group_index], self.ordering_req);
                             match compare_rows(
                                 &self.orderings[group_index],
                                 orderings,
                                 &get_sort_options(self.ordering_req.as_ref()),
                             ) {
+                                // we may set to none when we resize the firsts array
                                 Ok(result)
                                     if result.is_gt()
                                         || self.first[group_index].is_null() =>

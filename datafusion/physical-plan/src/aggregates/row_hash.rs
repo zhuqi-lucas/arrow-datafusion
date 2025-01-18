@@ -701,11 +701,6 @@ impl Stream for GroupedHashAggregateStream {
                         // (Final/FinalPartitioned/Single/SinglePartitioned)
                         Some(Ok(batch)) => {
                             let timer = elapsed_compute.timer();
-
-                            println!(
-                                "GroupedHashAggregateStream::poll_next: batch: {:?}",
-                                batch
-                            );
                             // Make sure we have enough capacity for `batch`, otherwise spill
                             extract_ok!(self.spill_previous_if_necessary(&batch));
 
@@ -841,8 +836,6 @@ impl GroupedHashAggregateStream {
             evaluate_group_by(&self.group_by, &batch)?
         };
 
-        println!("group_by_values : {:?}", group_by_values);
-
         // Evaluate the aggregation expressions.
         let input_values = if self.spill_state.is_stream_merging {
             evaluate_many(&self.spill_state.merging_aggregate_arguments, &batch)?
@@ -904,9 +897,6 @@ impl GroupedHashAggregateStream {
                         if opt_filter.is_some() {
                             return internal_err!("aggregate filter should be applied in partial stage, there should be no filter in final stage");
                         }
-
-                        println!("数据准备合并？ : {:?} group_index: {:?} total_num_groups {:?}", values, group_indices, total_num_groups);
-
                         // if aggregation is over intermediate states,
                         // use merge
                         acc.merge_batch(values, group_indices, None, total_num_groups)?;
@@ -961,8 +951,6 @@ impl GroupedHashAggregateStream {
             self.group_ordering.remove_groups(n);
         }
 
-        println!("output : {:?}", output);
-
         // Next output each aggregate value
         for acc in self.accumulators.iter_mut() {
             match self.mode {
@@ -979,8 +967,6 @@ impl GroupedHashAggregateStream {
             }
         }
 
-        println!("output final : {:?}", output);
-        println!("schema : {:?}", schema);
         // emit reduces the memory usage. Ignore Err from update_memory_reservation. Even if it is
         // over the target memory size after emission, we can emit again rather than returning Err.
         let _ = self.update_memory_reservation();
@@ -994,7 +980,6 @@ impl GroupedHashAggregateStream {
     /// (~ 1 [`RecordBatch`]) for simplicity. In such cases, spill the data to disk and clear the
     /// memory. Currently only [`GroupOrdering::None`] is supported for spilling.
     fn spill_previous_if_necessary(&mut self, batch: &RecordBatch) -> Result<()> {
-        println!("数据是 : {:?}", batch);
         // TODO: support group_ordering for spilling
         if self.group_values.len() > 0
             && batch.num_rows() > 0
