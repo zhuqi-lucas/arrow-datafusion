@@ -100,11 +100,13 @@ pub fn spill_record_batch_by_size(
     let total_rows = batch.num_rows();
     let mut writer = IPCWriter::new(&path, schema.as_ref())?;
 
+    println!("写入前 数据 {:?}", batch);
     while offset < total_rows {
         let length = std::cmp::min(total_rows - offset, batch_size_rows);
         let batch = batch.slice(offset, length);
         offset += batch.num_rows();
         writer.write(&batch)?;
+        println!("写入文件 数据 {:?}", batch);
     }
     writer.finish()?;
 

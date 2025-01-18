@@ -20,12 +20,13 @@
 use std::any::Any;
 use std::fmt::Debug;
 use std::mem::size_of_val;
+use std::ptr::null;
 use std::sync::Arc;
 
 use crate::correlation::CorrelationGroupsAccumulator;
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Float64Array, StructArray, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, AsArray, BooleanArray, Float64Array, PrimitiveArray, StructArray,
+    UInt32Array, UInt64Array,
 };
 use arrow::compute::{self, lexsort_to_indices, take, take_arrays, SortColumn};
 use arrow::datatypes::{DataType, Field};
@@ -239,6 +240,11 @@ pub struct FirstValueGroupsAccumulator {
 impl FirstValueGroupsAccumulator {
     // Updates state with the values in the given row.
     fn update_with_new_row(&mut self, row: &[ScalarValue], group_index: usize) {
+        println!(
+            "updating with group_index: {:?} new row: {:?}",
+            group_index, row
+        );
+        println!("updating first value: {:?}", row[0].clone());
         self.first[group_index] = row[0].clone();
         self.orderings[group_index] = row[1..].to_vec();
         self.is_set[group_index] = true;
@@ -285,20 +291,45 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
-        self.first.resize(total_num_groups, ScalarValue::Null);
-        self.is_set.resize(total_num_groups, false);
-        self.orderings
-            .resize(total_num_groups, vec![ScalarValue::Null; 0]);
+        // 如果当前长度不足，扩展长度并填充 `ScalarValue::Float64(None)`
+        if self.first.len() < total_num_groups {
+            self.first.extend(
+                (self.first.len()..total_num_groups).map(|_| ScalarValue::Float64(None)),
+            );
+        }
+
+        // 确保其他辅助字段同样扩展到合适的长度
+        if self.is_set.len() < total_num_groups {
+            self.is_set
+                .extend((self.is_set.len()..total_num_groups).map(|_| false));
+        }
+
+        if self.orderings.len() < total_num_groups {
+            self.orderings.extend(
+                (self.orderings.len()..total_num_groups)
+                    .map(|_| vec![ScalarValue::Float64(None); 0]),
+            );
+        }
+
+        println!(
+            "FirstValueGroupsAccumulator::update_batch: group_indices: {:?}",
+            group_indices
+        );
+        println!(
+            "FirstValueGroupsAccumulator::update_batch: values: {:?}",
+            values
+        );
 
         accumulate_multiple_row(
             group_indices,
             values,
             opt_filter,
-            |batch_idx, group_index, group_indices| {
+            |batch_idx, group_index, values| {
                 if self.is_set[group_index] {
                     match get_row_at_idx(values, batch_idx) {
                         Ok(row) => {
                             let orderings = &row[1..];
+                            println!("FirstValueGroupsAccumulator::update_batch: orderings: {:?}", orderings);
                             match compare_rows(
                                 &self.orderings[group_index],
                                 orderings,
@@ -336,6 +367,10 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+        println!(
+            "FirstValueGroupsAccumulator::evaluate: self.first: {:?}",
+            self.first
+        );
         ScalarValue::iter_to_array(emit_to.take_needed(&mut self.first))
     }
 
@@ -372,6 +407,8 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
             is_set_scalar_values.iter().cloned(),
         )?);
 
+        println!("FirstValueGroupsAccumulator::state: res: {:?}", res);
+
         Ok(res)
     }
 
@@ -382,7 +419,92 @@ impl GroupsAccumulator for FirstValueGroupsAccumulator {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
-        self.update_batch(values, group_indices, opt_filter, total_num_groups)
+        println!(
+            "FirstValueGroupsAccumulator::merge_batch: 数据 values: {:?}",
+            values
+        );
+        println!(
+            "FirstValueGroupsAccumulator::merge_batch: 数据 group_indices: {:?}",
+            group_indices
+        );
+
+        // 如果当前长度不足，扩展长度并填充 `ScalarValue::Float64(None)`
+        if self.first.len() < total_num_groups {
+            self.first.extend(
+                (self.first.len()..total_num_groups).map(|_| ScalarValue::Float64(None)),
+            );
+        }
+
+        // 确保其他辅助字段同样扩展到合适的长度
+        if self.is_set.len() < total_num_groups {
+            self.is_set
+                .extend((self.is_set.len()..total_num_groups).map(|_| false));
+        }
+
+        if self.orderings.len() < total_num_groups {
+            self.orderings.extend(
+                (self.orderings.len()..total_num_groups)
+                    .map(|_| vec![ScalarValue::Float64(None); 0]),
+            );
+        }
+
+        // remove last column for values and keep the type same
+        let values = values.split_last().unwrap().1;
+        accumulate_multiple_row(
+            group_indices,
+            values,
+            opt_filter,
+            |batch_idx, group_index, values| {
+                println!("FirstValueGroupsAccumulator::merge_batch: group_index: {:?}, values: {:?}, batch_idx: {:?}", group_index, values, batch_idx);
+                if self.is_set[group_index] {
+                    println!("FirstValueGroupsAccumulator::merge_batch: self.is_set[group_index]: {:?}, firsts value {:?}", self.is_set[group_index], self.first[group_index]);
+                    match get_row_at_idx(values, batch_idx) {
+                        Ok(row) => {
+                            println!(
+                                "FirstValueGroupsAccumulator::merge_batch: row: {:?}",
+                                row
+                            );
+                            let orderings = &row[1..];
+
+                            println!("FirstValueGroupsAccumulator::merge_batch: orderings: {:?} 和 self.orderings: {:?}, ordering_req {:?}", orderings, self.orderings[group_index], self.ordering_req);
+                            match compare_rows(
+                                &self.orderings[group_index],
+                                orderings,
+                                &get_sort_options(self.ordering_req.as_ref()),
+                            ) {
+                                Ok(result)
+                                    if result.is_gt()
+                                        || self.first[group_index].is_null() =>
+                                {
+                                    self.update_with_new_row(&row, group_index);
+                                }
+                                Err(e) => {
+                                    // Handle error from compare_rows
+                                    eprintln!("Error comparing rows: {:?}", e);
+                                }
+                                _ => {}
+                            }
+                        }
+                        Err(e) => {
+                            // Handle error from get_row_at_idx
+                            eprintln!("Error: {:?}", e);
+                        }
+                    }
+                } else {
+                    match get_row_at_idx(values, batch_idx) {
+                        Ok(row) => {
+                            self.update_with_new_row(&row, group_index);
+                        }
+                        Err(e) => {
+                            // Handle error from get_row_at_idx
+                            eprintln!("Error: {:?}", e);
+                        }
+                    }
+                }
+            },
+        );
+
+        Ok(())
     }
 
     fn size(&self) -> usize {
