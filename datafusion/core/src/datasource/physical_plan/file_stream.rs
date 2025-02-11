@@ -299,6 +299,8 @@ impl FileStream {
             metadata_size_hint: part_file.metadata_size_hint,
         };
 
+        println!("partition values: {:?}", part_file.partition_values);
+
         Some(
             self.file_opener
                 .open(file_meta)
@@ -392,6 +394,7 @@ impl FileStream {
                     }
                     match ready!(reader.poll_next_unpin(cx)) {
                         Some(Ok(batch)) => {
+                            println!("current batch: {:?}", batch);
                             self.file_stream_metrics.time_scanning_until_data.stop();
                             self.file_stream_metrics.time_scanning_total.stop();
                             let result = self

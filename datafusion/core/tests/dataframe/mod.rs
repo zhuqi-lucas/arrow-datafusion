@@ -5271,3 +5271,91 @@ async fn register_non_parquet_file() {
         "1.json' does not match the expected extension '.parquet'"
     );
 }
+
+#[tokio::test]
+async fn write_parquet_test() -> Result<()> {
+    let tmp_dir = TempDir::new()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Int32, true),
+    ]));
+
+    let ctx = SessionContext::new();
+    let write_df1 = ctx.read_batch(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![2])),
+        ],
+    )?)?;
+
+    let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, true)]));
+    let write_df2 = ctx.read_batch(RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![3]))],
+    )?)?;
+
+    let test_path = tmp_dir.path().join("test");
+    let test_path1 = test_path.join("data1.parquet");
+    let test_path2 = test_path.join("a=2/data2.parquet");
+
+    write_df1
+        .clone()
+        .write_parquet(
+            test_path1.to_str().unwrap(),
+            DataFrameWriteOptions::new(),
+            None,
+        )
+        .await?;
+
+    write_df2
+        .clone()
+        .write_parquet(
+            test_path2.to_str().unwrap(),
+            DataFrameWriteOptions::new(),
+            None,
+        )
+        .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_parquet(
+        "data",
+        test_path.to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await?;
+
+    let df = ctx.sql("SELECT * FROM data").await?;
+    let results = df.collect().await?;
+
+
+    // let dfExplain = ctx.sql("EXPLAIN verbose SELECT * FROM data").await?;
+    // let explainRes = dfExplain.collect().await?;
+    //
+    // assert_batches_eq!(
+    //     &[
+    //         "+---+---+",
+    //         "| b | a |",
+    //         "+---+---+",
+    //         "| 3 |   |",
+    //         "| 2 | 1 |",
+    //         "+---+---+",
+    //     ],
+    //     &results
+    // );
+
+
+    assert_batches_eq!(
+        &[
+            "+---+---+",
+            "| b | a |",
+            "+---+---+",
+            "| 3 |   |",
+            "| 2 | 1 |",
+            "+---+---+",
+        ],
+        &results
+    );
+
+    Ok(())
+}

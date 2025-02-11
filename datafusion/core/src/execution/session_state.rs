@@ -178,6 +178,8 @@ pub struct SessionState {
     /// Cache logical plans of prepared statements for later execution.
     /// Key is the prepared statement name.
     prepared_plans: HashMap<String, Arc<PreparedPlan>>,
+
+    partition_cols: Vec<String>,
 }
 
 impl Debug for SessionState {

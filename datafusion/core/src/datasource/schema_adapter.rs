@@ -373,6 +373,8 @@ impl SchemaMapper for SchemaMapping {
         let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
 
         let schema = Arc::clone(&self.projected_table_schema);
+
+        println!("Schema: {:?} batch: {:?}", schema, batch);
         let record_batch = RecordBatch::try_new_with_options(schema, cols, &options)?;
         Ok(record_batch)
     }

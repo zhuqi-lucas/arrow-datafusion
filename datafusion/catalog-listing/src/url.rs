@@ -247,6 +247,7 @@ impl ListingTableUrl {
                     } else {
                         let list_res = store.list(Some(&self.prefix));
                         let vec = list_res.try_collect::<Vec<ObjectMeta>>().await?;
+                        println!("cache Put list {:?}", vec);
                         cache.put(&self.prefix, Arc::new(vec.clone()));
                         futures::stream::iter(vec.into_iter().map(Ok)).boxed()
                     }
@@ -254,8 +255,10 @@ impl ListingTableUrl {
             },
             false => futures::stream::once(store.head(&self.prefix)).boxed(),
         };
+
         Ok(list
             .try_filter(move |meta| {
+                println!("meta {:?}", meta.clone());
                 let path = &meta.location;
                 let extension_match = path.as_ref().ends_with(file_extension);
                 let glob_match = self.contains(path, ignore_subdirectory);

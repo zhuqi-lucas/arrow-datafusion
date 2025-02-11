@@ -632,6 +632,7 @@ impl PartitionColumnProjector {
             }
         }
 
+
         let mut projected_partition_indexes: Vec<_> = idx_map.into_iter().collect();
         projected_partition_indexes.sort_by(|(_, a), (_, b)| a.cmp(b));
 
@@ -654,6 +655,8 @@ impl PartitionColumnProjector {
         let expected_cols =
             self.projected_schema.fields().len() - self.projected_partition_indexes.len();
 
+        println!("file_batch: {:?} partition_values: {:?}", file_batch, partition_values);
+
         if file_batch.columns().len() != expected_cols {
             return exec_err!(
                 "Unexpected batch schema from file, expected {} cols but got {}",
@@ -663,6 +666,8 @@ impl PartitionColumnProjector {
         }
 
         let mut cols = file_batch.columns().to_vec();
+
+        println!("partition index: {:?}", self.projected_partition_indexes);
         for &(pidx, sidx) in &self.projected_partition_indexes {
             let p_value =
                 partition_values

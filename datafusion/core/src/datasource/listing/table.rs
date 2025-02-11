@@ -58,6 +58,7 @@ use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use futures::{future, stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use object_store::ObjectStore;
+use crate::prelude::SessionContext;
 
 /// Configuration for creating a [`ListingTable`]
 #[derive(Debug, Clone)]
@@ -597,13 +598,20 @@ impl ListingOptions {
             })
             .collect_vec();
 
+
+        println!("partition_keys: {:?}", partition_keys);
+
         match partition_keys.into_iter().all_equal_value() {
             Ok(v) => Ok(v),
             Err(None) => Ok(vec![]),
             Err(Some(diff)) => {
                 let mut sorted_diff = [diff.0, diff.1];
                 sorted_diff.sort();
-                plan_err!("Found mixed partition values on disk {:?}", sorted_diff)
+                if sorted_diff[0].is_empty() && !sorted_diff[1].is_empty() {
+                    Ok(sorted_diff[1].clone())
+                } else {
+                    plan_err!("Found mixed partition values on disk {:?}", sorted_diff)
+                }
             }
         }
     }
@@ -729,6 +737,7 @@ impl ListingTable {
     /// partitioning columns.
     ///
     pub fn try_new(config: ListingTableConfig) -> Result<Self> {
+
         let file_schema = config
             .file_schema
             .ok_or_else(|| DataFusionError::Internal("No schema provided.".into()))?;
@@ -847,13 +856,28 @@ impl TableProvider for ListingTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+
+        let partitions = self
+            .options.infer_partitions(state, &self.table_paths.first().unwrap()).await?;
+
+        println!("Partitions: {:?}", partitions);
+
+
         // extract types of partition columns
-        let table_partition_cols = self
+        let mut table_partition_cols = self
             .options
             .table_partition_cols
             .iter()
             .map(|col| Ok(self.table_schema.field_with_name(&col.0)?.clone()))
             .collect::<Result<Vec<_>>>()?;
+
+        if table_partition_cols.is_empty() {
+            table_partition_cols = partitions
+                .iter()
+                .map(|col| Ok(self.table_schema.field_with_name(&col)?.clone()))
+                .collect::<Result<Vec<_>>>()?;
+
+        }
 
         let table_partition_col_names = table_partition_cols
             .iter()
@@ -871,6 +895,7 @@ impl TableProvider for ListingTable {
         // We should not limit the number of partitioned files to scan if there are filters and limit
         // at the same time. This is because the limit should be applied after the filters are applied.
         let statistic_file_limit = if filters.is_empty() { limit } else { None };
+
 
         let (mut partitioned_file_lists, statistics) = self
             .list_files_for_scan(session_state, &partition_filters, statistic_file_limit)
@@ -1104,7 +1129,25 @@ impl ListingTable {
         } else {
             return Ok((vec![], Statistics::new_unknown(&self.file_schema)));
         };
-        // list files (with partitions)
+
+
+        let partitions = self
+            .options.infer_partitions(ctx, &self.table_paths.first().unwrap()).await?;
+
+        println!("Partitions: {:?}", partitions);
+
+        let mut table_partition_cols = vec![];
+        if self.options.table_partition_cols.is_empty() && !partitions.is_empty(){
+              for partition in partitions {
+                table_partition_cols.push((partition.clone(), DataType::Utf8));
+              }
+        } else {
+            table_partition_cols = self.options.table_partition_cols.clone();
+        }
+
+
+        println!("partition cols: {:?}", self.options.table_partition_cols);
+
         let file_list = future::try_join_all(self.table_paths.iter().map(|table_path| {
             pruned_partition_list(
                 ctx,
@@ -1112,11 +1155,12 @@ impl ListingTable {
                 table_path,
                 filters,
                 &self.options.file_extension,
-                &self.options.table_partition_cols,
+                &table_partition_cols,
             )
         }))
         .await?;
         let file_list = stream::iter(file_list).flatten();
+
         // collect the statistics if required by the config
         let files = file_list
             .map(|part_file| async {
