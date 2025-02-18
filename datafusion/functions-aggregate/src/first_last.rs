@@ -390,15 +390,6 @@ impl GroupsAccumulator for FirstValueGroupAccumulator {
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         println!("state function");
 
-        // let mut fields = vec![Field::new(
-        //     format_state_name(args.name, "first_value"),
-        //     args.return_type.clone(),
-        //     true,
-        // )];
-        // fields.extend(args.ordering_fields.to_vec());
-        // fields.push(Field::new("is_set", DataType::Boolean, true));
-        // Ok(fields)
-
         let mut res = Vec::new();
 
 
@@ -406,14 +397,27 @@ impl GroupsAccumulator for FirstValueGroupAccumulator {
         // Emit values
         let emit_group_values = emit_to.take_needed(&mut self.values);
         let emit_first = Arc::new(ScalarValue::iter_to_array(self.first.iter().cloned())?) as ArrayRef;
-
         res.push(emit_first);
-        let emit_orderings = self.orderings.iter()
-            .map(|col| ScalarValue::iter_to_array(col.iter().cloned()).map(Arc::new))
-            .collect::<Result<Vec<_>>>()?;
 
 
-        res.extend(emit_orderings.into_iter().map(|arc| Arc::clone(&*arc)));
+
+        // 初始化每列的数据向量
+        let mut columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); emit_group_values.len()];
+
+        for row in &self.orderings {
+            for (i, value) in row.into_iter().enumerate() {
+                columns[i].push(value.clone());
+            }
+        }
+
+        // 将每列的 Vec<ScalarValue> 转换为 ArrayRef
+        let arrays: Result<Vec<ArrayRef>> = columns
+            .into_iter()
+            .map(|col| ScalarValue::iter_to_array(col.into_iter()).map(|array| Arc::new(array) as ArrayRef))
+            .collect();
+
+
+        res.extend(arrays?);
 
         let emit_is_set = Arc::new(BooleanArray::from(self.is_set.clone())) as ArrayRef;
 
