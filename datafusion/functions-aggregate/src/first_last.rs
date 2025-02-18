@@ -20,6 +20,7 @@
 use std::any::Any;
 use std::fmt::Debug;
 use std::mem::size_of_val;
+use std::process::id;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, AsArray, BooleanArray};
@@ -31,7 +32,10 @@ use datafusion_common::{
 };
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::{format_state_name, AggregateOrderSensitivity};
-use datafusion_expr::{Accumulator, AggregateUDFImpl, Documentation, EmitTo, Expr, ExprFunctionExt, GroupsAccumulator, Signature, SortExpr, Volatility};
+use datafusion_expr::{
+    Accumulator, AggregateUDFImpl, Documentation, EmitTo, Expr, ExprFunctionExt,
+    GroupsAccumulator, Signature, SortExpr, Volatility,
+};
 use datafusion_functions_aggregate_common::utils::get_sort_options;
 use datafusion_macros::user_doc;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -175,7 +179,10 @@ impl AggregateUDFImpl for FirstValue {
         self.doc()
     }
 
-    fn create_groups_accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn GroupsAccumulator>> {
+    fn create_groups_accumulator(
+        &self,
+        acc_args: AccumulatorArgs,
+    ) -> Result<Box<dyn GroupsAccumulator>> {
         let ordering_dtypes = acc_args
             .ordering_req
             .iter()
@@ -193,7 +200,7 @@ impl AggregateUDFImpl for FirstValue {
             acc_args.ordering_req.clone(),
             acc_args.ignore_nulls,
         )
-            .map(|acc| Box::new(acc.with_requirement_satisfied(requirement_satisfied)) as _)
+        .map(|acc| Box::new(acc.with_requirement_satisfied(requirement_satisfied)) as _)
     }
 
     fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
@@ -205,8 +212,10 @@ impl AggregateUDFImpl for FirstValue {
 pub struct FirstValueGroupAccumulator {
     first: Vec<ScalarValue>,
 
-    // mapping index to the group values
-    values: Vec<Vec<ScalarValue>>,
+    data_type: DataType,
+
+    // mapping group index to the group rows
+    values: Vec<Vec<Vec<ScalarValue>>>,
 
     // At the beginning, `is_set` is false, which means `first` is not seen yet.
     // Once we see the first value, we set the `is_set` flag and do not update `first` anymore.
@@ -238,6 +247,7 @@ impl FirstValueGroupAccumulator {
         let requirement_satisfied = ordering_req.is_empty();
 
         ScalarValue::try_from(data_type).map(|first| Self {
+            data_type: data_type.clone(),
             values: vec![],
             first: vec![first],
             is_set: vec![false],
@@ -252,43 +262,124 @@ impl FirstValueGroupAccumulator {
         self.requirement_satisfied = requirement_satisfied;
         self
     }
+
+    // Updates state with the values in the given row.
+    fn update_with_new_row(&mut self, group_index: usize, row: &[ScalarValue]) {
+
+        println!("更新行 : {:?}", row);
+        self.first[group_index] = row[0].clone();
+        self.orderings[group_index] = row[1..].to_vec();
+        self.is_set[group_index] = true;
+    }
+
+    /// 修改后的 get_first_idx，现在传入的 `rows` 表示一组行，每行是 Vec<ScalarValue>
+    /// 第一列作为主要值，其余列作为排序依据
+    fn get_first_idx(&self, rows: &[Vec<ScalarValue>]) -> Result<Option<usize>> {
+        if rows.is_empty() {
+            return internal_err!("Empty row in FIRST_VALUE");
+        }
+
+        // 当 requirement 已经满足时，只根据第一列判断
+        if self.requirement_satisfied {
+            if self.ignore_nulls {
+                // 找出第一行其第一列非 null 的
+                for (i, row) in rows.iter().enumerate() {
+                    if !row[0].is_null() {
+                        return Ok(Some(i));
+                    }
+                }
+                return Ok(None);
+            } else {
+                return Ok(Some(0));
+            }
+        }
+
+        // 否则，根据排序要求比较每一行的排序部分（即 row[1..]）
+        let mut min_idx: Option<usize> = None;
+        for (i, row) in rows.iter().enumerate() {
+            // 若忽略 null，则跳过第一列为 null 的行
+            if self.ignore_nulls && row[0].is_null() {
+                continue;
+            }
+            if let Some(current) = min_idx {
+                let current_ordering = &rows[current][1..];
+                let candidate_ordering = &row[1..];
+                if compare_rows(
+                    current_ordering,
+                    candidate_ordering,
+                    &get_sort_options(self.ordering_req.as_ref()),
+                )?
+                    .is_gt()
+                {
+                    min_idx = Some(i);
+                }
+            } else {
+                min_idx = Some(i);
+            }
+        }
+        Ok(min_idx)
+    }
 }
 
 impl GroupsAccumulator for FirstValueGroupAccumulator {
-    fn update_batch(&mut self, values: &[ArrayRef], group_indices: &[usize], opt_filter: Option<&BooleanArray>, total_num_groups: usize) -> Result<()> {
+    fn update_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        self.first.resize(total_num_groups, ScalarValue::try_from(self.data_type.clone())?);
         self.is_set.resize(total_num_groups, false);
-        self.
+        self.values.resize(total_num_groups, Vec::new());
+        self.orderings.resize(total_num_groups, Vec::new());
 
-        for (i, group_idx) in group_indices.iter().enumerate() {
-            let group_idx = *group_idx;
-            let value = values[0].as_any().downcast_ref::<ScalarValue>().unwrap();
-            let orderings = values[1..].iter().map(|v| v.as_any().downcast_ref::<ScalarValue>().unwrap()).collect::<Vec<_>>();
-            if !self.is_set[group_idx] {
-                if let Some(first_idx) = self.get_first_idx(values)? {
-                    let row = get_row_at_idx(values, first_idx)?;
-                    self.update_with_new_row(&row);
-                }
-            } else if !self.requirement_satisfied {
-                if let Some(first_idx) = self.get_first_idx(values)? {
-                    let row = get_row_at_idx(values, first_idx)?;
-                    let orderings = &row[1..];
-                    if compare_rows(
-                        &self.orderings,
-                        orderings,
-                        &get_sort_options(self.ordering_req.as_ref()),
-                    )?
-                    .is_gt()
-                    {
-                        self.update_with_new_row(&row);
+        // 将每一行分配到对应的组中
+        for (idx, group_idx) in group_indices.iter().enumerate() {
+            // 假设 get_row_at_idx 返回 Vec<ScalarValue>
+            let row = get_row_at_idx(values, idx)?;
+            self.values[*group_idx].push(row);
+        }
+
+        for group_idx in 0..self.values.len() {
+            // 仅在未设置或未满足需求时进行更新
+            if !self.is_set[group_idx] || !self.requirement_satisfied {
+                let group = &self.values[group_idx];
+                if let Some(first_idx) = self.get_first_idx(group).unwrap() {
+                    // 克隆一份行数据，结束对 group 的借用
+                    let row = group[first_idx].clone();
+
+                    if !self.is_set[group_idx] {
+                        self.update_with_new_row(group_idx, &row);
+                    } else {
+                        let orderings = &row[1..];
+                        if compare_rows(
+                            &self.orderings[group_idx],
+                            orderings,
+                            &get_sort_options(self.ordering_req.as_ref()),
+                        )
+                            .unwrap()
+                            .is_gt()
+                        {
+                            self.update_with_new_row(group_idx, &row);
+                        }
                     }
                 }
             }
         }
 
-        todo!()
+
+        Ok(())
     }
 
-    fn merge_batch(&mut self, values: &[ArrayRef], group_indices: &[usize], opt_filter: Option<&BooleanArray>, total_num_groups: usize) -> Result<()> {
+
+    fn merge_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
         todo!()
     }
 
@@ -297,22 +388,63 @@ impl GroupsAccumulator for FirstValueGroupAccumulator {
     }
 
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
-        todo!()
+        println!("state function");
+
+        // let mut fields = vec![Field::new(
+        //     format_state_name(args.name, "first_value"),
+        //     args.return_type.clone(),
+        //     true,
+        // )];
+        // fields.extend(args.ordering_fields.to_vec());
+        // fields.push(Field::new("is_set", DataType::Boolean, true));
+        // Ok(fields)
+
+        let mut res = Vec::new();
+
+
+
+        // Emit values
+        let emit_group_values = emit_to.take_needed(&mut self.values);
+        let emit_first = Arc::new(ScalarValue::iter_to_array(self.first.iter().cloned())?) as ArrayRef;
+
+        res.push(emit_first);
+        let emit_orderings = self.orderings.iter()
+            .map(|col| ScalarValue::iter_to_array(col.iter().cloned()).map(Arc::new))
+            .collect::<Result<Vec<_>>>()?;
+
+
+        res.extend(emit_orderings.into_iter().map(|arc| Arc::clone(&*arc)));
+
+        let emit_is_set = Arc::new(BooleanArray::from(self.is_set.clone())) as ArrayRef;
+
+        res.push(emit_is_set);
+
+        println!("state function end {:?}", res);
+
+        Ok(res)
     }
 
-    fn convert_to_state(&self, _values: &[ArrayRef], _opt_filter: Option<&BooleanArray>) -> Result<Vec<ArrayRef>> {
+    fn convert_to_state(
+        &self,
+        _values: &[ArrayRef],
+        _opt_filter: Option<&BooleanArray>,
+    ) -> Result<Vec<ArrayRef>> {
         todo!()
     }
 
     fn supports_convert_to_state(&self) -> bool {
-        todo!()
+        true
     }
 
     fn size(&self) -> usize {
-        todo!()
+         size_of_val(self) - size_of_val(&self.first)
+            + self.first.iter().map(|v| v.size()).sum::<usize>()
+            + self.values.iter().map(|v| v.len()).sum::<usize>()
+            + self.orderings.iter().map(|v| v.len()).sum::<usize>()
+            + self.is_set.len()
+            + size_of_val(&self.ordering_req)
     }
 }
-
 
 #[derive(Debug)]
 pub struct FirstValueAccumulator {
