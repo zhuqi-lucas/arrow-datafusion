@@ -31,10 +31,7 @@ use datafusion_common::{
 };
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::{format_state_name, AggregateOrderSensitivity};
-use datafusion_expr::{
-    Accumulator, AggregateUDFImpl, Documentation, Expr, ExprFunctionExt, Signature,
-    SortExpr, Volatility,
-};
+use datafusion_expr::{Accumulator, AggregateUDFImpl, Documentation, EmitTo, Expr, ExprFunctionExt, GroupsAccumulator, Signature, SortExpr, Volatility};
 use datafusion_functions_aggregate_common::utils::get_sort_options;
 use datafusion_macros::user_doc;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -177,7 +174,145 @@ impl AggregateUDFImpl for FirstValue {
     fn documentation(&self) -> Option<&Documentation> {
         self.doc()
     }
+
+    fn create_groups_accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn GroupsAccumulator>> {
+        let ordering_dtypes = acc_args
+            .ordering_req
+            .iter()
+            .map(|e| e.expr.data_type(acc_args.schema))
+            .collect::<Result<Vec<_>>>()?;
+
+        // When requirement is empty, or it is signalled by outside caller that
+        // the ordering requirement is/will be satisfied.
+        let requirement_satisfied =
+            acc_args.ordering_req.is_empty() || self.requirement_satisfied;
+
+        FirstValueGroupAccumulator::try_new(
+            acc_args.return_type,
+            &ordering_dtypes,
+            acc_args.ordering_req.clone(),
+            acc_args.ignore_nulls,
+        )
+            .map(|acc| Box::new(acc.with_requirement_satisfied(requirement_satisfied)) as _)
+    }
+
+    fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
+        true
+    }
 }
+
+#[derive(Debug)]
+pub struct FirstValueGroupAccumulator {
+    first: Vec<ScalarValue>,
+
+    // mapping index to the group values
+    values: Vec<Vec<ScalarValue>>,
+
+    // At the beginning, `is_set` is false, which means `first` is not seen yet.
+    // Once we see the first value, we set the `is_set` flag and do not update `first` anymore.
+    is_set: Vec<bool>,
+    // Stores ordering values, of the aggregator requirement corresponding to first value
+    // of the aggregator. These values are used during merging of multiple partitions.
+    orderings: Vec<Vec<ScalarValue>>,
+    // Stores the applicable ordering requirement.
+    ordering_req: LexOrdering,
+    // Stores whether incoming data already satisfies the ordering requirement.
+    requirement_satisfied: bool,
+    // Ignore null values.
+    ignore_nulls: bool,
+}
+
+impl FirstValueGroupAccumulator {
+    /// Creates a new `FirstValueAccumulator` for the given `data_type`.
+    pub fn try_new(
+        data_type: &DataType,
+        ordering_dtypes: &[DataType],
+        ordering_req: LexOrdering,
+        ignore_nulls: bool,
+    ) -> Result<Self> {
+        let orderings = ordering_dtypes
+            .iter()
+            .map(ScalarValue::try_from)
+            .collect::<Result<Vec<_>>>()?;
+
+        let requirement_satisfied = ordering_req.is_empty();
+
+        ScalarValue::try_from(data_type).map(|first| Self {
+            values: vec![],
+            first: vec![first],
+            is_set: vec![false],
+            orderings: vec![orderings],
+            ordering_req,
+            requirement_satisfied,
+            ignore_nulls,
+        })
+    }
+
+    pub fn with_requirement_satisfied(mut self, requirement_satisfied: bool) -> Self {
+        self.requirement_satisfied = requirement_satisfied;
+        self
+    }
+}
+
+impl GroupsAccumulator for FirstValueGroupAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef], group_indices: &[usize], opt_filter: Option<&BooleanArray>, total_num_groups: usize) -> Result<()> {
+        self.is_set.resize(total_num_groups, false);
+        self.
+
+        for (i, group_idx) in group_indices.iter().enumerate() {
+            let group_idx = *group_idx;
+            let value = values[0].as_any().downcast_ref::<ScalarValue>().unwrap();
+            let orderings = values[1..].iter().map(|v| v.as_any().downcast_ref::<ScalarValue>().unwrap()).collect::<Vec<_>>();
+            if !self.is_set[group_idx] {
+                if let Some(first_idx) = self.get_first_idx(values)? {
+                    let row = get_row_at_idx(values, first_idx)?;
+                    self.update_with_new_row(&row);
+                }
+            } else if !self.requirement_satisfied {
+                if let Some(first_idx) = self.get_first_idx(values)? {
+                    let row = get_row_at_idx(values, first_idx)?;
+                    let orderings = &row[1..];
+                    if compare_rows(
+                        &self.orderings,
+                        orderings,
+                        &get_sort_options(self.ordering_req.as_ref()),
+                    )?
+                    .is_gt()
+                    {
+                        self.update_with_new_row(&row);
+                    }
+                }
+            }
+        }
+
+        todo!()
+    }
+
+    fn merge_batch(&mut self, values: &[ArrayRef], group_indices: &[usize], opt_filter: Option<&BooleanArray>, total_num_groups: usize) -> Result<()> {
+        todo!()
+    }
+
+    fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+        todo!()
+    }
+
+    fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        todo!()
+    }
+
+    fn convert_to_state(&self, _values: &[ArrayRef], _opt_filter: Option<&BooleanArray>) -> Result<Vec<ArrayRef>> {
+        todo!()
+    }
+
+    fn supports_convert_to_state(&self) -> bool {
+        todo!()
+    }
+
+    fn size(&self) -> usize {
+        todo!()
+    }
+}
+
 
 #[derive(Debug)]
 pub struct FirstValueAccumulator {
