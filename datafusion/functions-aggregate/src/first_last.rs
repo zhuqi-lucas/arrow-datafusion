@@ -266,7 +266,7 @@ impl FirstValueGroupAccumulator {
     // Updates state with the values in the given row.
     fn update_with_new_row(&mut self, group_index: usize, row: &[ScalarValue]) {
 
-        println!("更新行 : {:?}", row);
+        // println!("更新行 : {:?}", row);
         self.first[group_index] = row[0].clone();
         self.orderings[group_index] = row[1..].to_vec();
         self.is_set[group_index] = true;
@@ -380,50 +380,98 @@ impl GroupsAccumulator for FirstValueGroupAccumulator {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
-        todo!()
+
+        self.first.resize(total_num_groups, ScalarValue::try_from(self.data_type.clone())?);
+        self.is_set.resize(total_num_groups, false);
+        self.values.resize(total_num_groups, Vec::new());
+        self.orderings.resize(total_num_groups, Vec::new());
+
+
+        // 将每一行分配到对应的组中
+        for (idx, group_idx) in group_indices.iter().enumerate() {
+            // 假设 get_row_at_idx 返回 Vec<ScalarValue>
+            let row = get_row_at_idx(values, idx)?;
+            // println!("merge_batch row first {:?}", row);
+            // if last column is false, skip the row
+            // otherwise, add the row but ignore the last column
+            if let ScalarValue::Boolean(Some(flag)) = row.last().unwrap() {
+                // println!("merge_batch row flag {:?}", flag);
+                if *flag {
+                    self.values[*group_idx].push(row[.. row.len()-1].to_vec());
+                }
+            }
+        }
+
+
+        for group_idx in 0..self.values.len() {
+            // 仅在未设置或未满足需求时进行更新
+            let group = &self.values[group_idx];
+            if let Some(first_idx) = self.get_first_idx(group).unwrap() {
+                // 克隆一份行数据，结束对 group 的借用
+                let row = group[first_idx].clone();
+
+                if !self.is_set[group_idx] {
+                    self.update_with_new_row(group_idx, &row);
+                } else {
+                    let orderings = &row[1..];
+                    if compare_rows(
+                        &self.orderings[group_idx],
+                        orderings,
+                        &get_sort_options(self.ordering_req.as_ref()),
+                    )
+                        .unwrap()
+                        .is_gt()
+                    {
+                        self.update_with_new_row(group_idx, &row);
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        todo!()
+        emit_to.take_needed(&mut self.is_set);
+        emit_to.take_needed(&mut self.values);
+        emit_to.take_needed(&mut self.orderings);
+        ScalarValue::iter_to_array(emit_to.take_needed(&mut self.first).into_iter())
     }
 
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
-        println!("state function");
+        // println!("state function");
 
         let mut res = Vec::new();
 
-
-
         // Emit values
         let emit_group_values = emit_to.take_needed(&mut self.values);
-        let emit_first = Arc::new(ScalarValue::iter_to_array(self.first.iter().cloned())?) as ArrayRef;
-        res.push(emit_first);
-
-
+        res.push(ScalarValue::iter_to_array(emit_to.take_needed(&mut self.first).into_iter())?);
 
         // 初始化每列的数据向量
         let mut columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); emit_group_values.len()];
 
-        for row in &self.orderings {
+        let mut emit_orderings = emit_to.take_needed(&mut self.orderings);
+
+        for row in emit_orderings {
             for (i, value) in row.into_iter().enumerate() {
                 columns[i].push(value.clone());
             }
         }
 
         // 将每列的 Vec<ScalarValue> 转换为 ArrayRef
-        let arrays: Result<Vec<ArrayRef>> = columns
-            .into_iter()
-            .map(|col| ScalarValue::iter_to_array(col.into_iter()).map(|array| Arc::new(array) as ArrayRef))
-            .collect();
+        for col in columns {
+            if col.is_empty() {
+                // 处理列为空的情况，例如，跳过或提供默认值
+                continue;
+            }
+            res.push(ScalarValue::iter_to_array(col.into_iter())?);
+        }
 
 
-        res.extend(arrays?);
-
-        let emit_is_set = Arc::new(BooleanArray::from(self.is_set.clone())) as ArrayRef;
-
-        res.push(emit_is_set);
-
-        println!("state function end {:?}", res);
+        // Vec<bool> to Vec<ScalarValue>
+        let mut is_set = self.is_set.iter().map(|v| ScalarValue::Boolean(Some(*v))).collect::<Vec<_>>();
+        
+        res.push(ScalarValue::iter_to_array(emit_to.take_needed(&mut is_set).into_iter())?);
 
         Ok(res)
     }
