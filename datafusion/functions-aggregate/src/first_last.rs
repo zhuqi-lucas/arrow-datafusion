@@ -345,7 +345,10 @@ impl GroupsAccumulator for FirstValueGroupAccumulator {
             // 仅在未设置或未满足需求时进行更新
             if !self.is_set[group_idx] || !self.requirement_satisfied {
                 let group = &self.values[group_idx];
-                if let Some(first_idx) = self.get_first_idx(group).unwrap() {
+                if group.is_empty() {
+                    continue;
+                }
+                if let Some(first_idx) = self.get_first_idx(group)? {
                     // 克隆一份行数据，结束对 group 的借用
                     let row = group[first_idx].clone();
 
@@ -406,7 +409,10 @@ impl GroupsAccumulator for FirstValueGroupAccumulator {
         for group_idx in 0..self.values.len() {
             // 仅在未设置或未满足需求时进行更新
             let group = &self.values[group_idx];
-            if let Some(first_idx) = self.get_first_idx(group).unwrap() {
+            if group.is_empty() {
+                continue;
+            }
+            if let Some(first_idx) = self.get_first_idx(group)? {
                 // 克隆一份行数据，结束对 group 的借用
                 let row = group[first_idx].clone();
 
@@ -470,7 +476,7 @@ impl GroupsAccumulator for FirstValueGroupAccumulator {
 
         // Vec<bool> to Vec<ScalarValue>
         let mut is_set = self.is_set.iter().map(|v| ScalarValue::Boolean(Some(*v))).collect::<Vec<_>>();
-        
+
         res.push(ScalarValue::iter_to_array(emit_to.take_needed(&mut is_set).into_iter())?);
 
         Ok(res)
@@ -478,10 +484,14 @@ impl GroupsAccumulator for FirstValueGroupAccumulator {
 
     fn convert_to_state(
         &self,
-        _values: &[ArrayRef],
+        values: &[ArrayRef],
         _opt_filter: Option<&BooleanArray>,
     ) -> Result<Vec<ArrayRef>> {
-        todo!()
+        let mut res = values.to_vec();
+        // add is_set flag default to false len is the same as value[0]
+        let is_set = vec![ScalarValue::Boolean(Some(false)); values[0].len()];
+        res.push(ScalarValue::iter_to_array(is_set.into_iter())?);
+        Ok(res)
     }
 
     fn supports_convert_to_state(&self) -> bool {
