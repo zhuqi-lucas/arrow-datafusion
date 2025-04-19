@@ -213,3 +213,21 @@ used_underscore_binding = "warn"
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tarpaulin)"] }
 unused_qualifications = "deny"
+
+
+## Temporary arrow-rs patch
+## https://github.com/apache/arrow-rs/pull/6921
+
+[patch.crates-io]
+arrow = { git = "https://github.com/zhuqi-lucas/arrow-rs", branch = "polish_better_decoder" }
+arrow-array = { git = "https://github.com/zhuqi-lucas/arrow-rs", branch = "polish_better_decoder" }
+arrow-buffer = { git = "https://github.com/zhuqi-lucas/arrow-rs", branch = "polish_better_decoder" }
+arrow-cast = { git = "https://github.com/zhuqi-lucas/arrow-rs", branch = "polish_better_decoder" }
+arrow-data = { git = "https://github.com/zhuqi-lucas/arrow-rs", branch = "polish_better_decoder" }
+arrow-ipc = { git = "https://github.com/zhuqi-lucas/arrow-rs", branch = "polish_better_decoder" }
+arrow-schema = { git = "https://github.com/zhuqi-lucas/arrow-rs", branch = "polish_better_decoder" }
+arrow-select = { git = "https://github.com/zhuqi-lucas/arrow-rs", branch = "polish_better_decoder" }
+arrow-string = { git = "https://github.com/zhuqi-lucas/arrow-rs", branch = "polish_better_decoder" }
+arrow-ord = { git = "https://github.com/zhuqi-lucas/arrow-rs", branch = "polish_better_decoder" }
+arrow-flight = { git = "https://github.com/zhuqi-lucas/arrow-rs", branch = "polish_better_decoder" }
+parquet = { git = "https://github.com/zhuqi-lucas/arrow-rs", branch = "polish_better_decoder" }
