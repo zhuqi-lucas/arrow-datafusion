@@ -54,6 +54,7 @@ use datafusion_physical_expr::{
     PhysicalSortExpr,
 };
 use datafusion_physical_plan::filter_pushdown::FilterPushdownPropagation;
+use datafusion_physical_plan::stream::YieldStream;
 use datafusion_physical_plan::{
     display::{display_orderings, ProjectSchemaDisplay},
     metrics::ExecutionPlanMetricsSet,
@@ -475,7 +476,13 @@ impl DataSource for FileScanConfig {
         let opener = source.create_file_opener(object_store, self, partition);
 
         let stream = FileStream::new(self, partition, opener, source.metrics())?;
-        Ok(Box::pin(stream))
+
+        // Yield control back to tokio after a certain number of batches so it can check for cancellation.
+        let boxed_stream: SendableRecordBatchStream = Box::pin(stream);
+        let yielding = YieldStream::new(boxed_stream);
+
+        let final_stream: SendableRecordBatchStream = Box::pin(yielding);
+        Ok(final_stream)
     }
 
     fn as_any(&self) -> &dyn Any {

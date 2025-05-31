@@ -211,6 +211,29 @@ impl Debug for SessionState {
     }
 }
 
+use std::sync::{atomic::{AtomicBool, Ordering}};
+
+#[derive(Clone, Debug)]
+pub struct CancellationToken {
+    inner: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.inner.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.load(Ordering::Relaxed)
+    }
+}
+
 #[async_trait]
 impl Session for SessionState {
     fn session_id(&self) -> &str {
@@ -1901,6 +1924,7 @@ impl From<&SessionState> for TaskContext {
             state.aggregate_functions.clone(),
             state.window_functions.clone(),
             Arc::clone(&state.runtime_env),
+            CancellationToken::new()
         )
     }
 }

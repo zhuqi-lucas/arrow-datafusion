@@ -48,6 +48,8 @@ pub struct TaskContext {
     window_functions: HashMap<String, Arc<WindowUDF>>,
     /// Runtime environment associated with this task context
     runtime: Arc<RuntimeEnv>,
+    // ... other fields
+    cancellation_token: CancellationToken,
 }
 
 impl Default for TaskContext {
@@ -63,6 +65,7 @@ impl Default for TaskContext {
             aggregate_functions: HashMap::new(),
             window_functions: HashMap::new(),
             runtime,
+            cancellation_token: CancellationToken::new(),
         }
     }
 }
@@ -81,6 +84,7 @@ impl TaskContext {
         aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
         window_functions: HashMap<String, Arc<WindowUDF>>,
         runtime: Arc<RuntimeEnv>,
+        cancellation_token: CancellationToken,
     ) -> Self {
         Self {
             task_id,
@@ -90,6 +94,7 @@ impl TaskContext {
             aggregate_functions,
             window_functions,
             runtime,
+            cancellation_token,
         }
     }
 
@@ -140,6 +145,18 @@ impl TaskContext {
     pub fn with_runtime(mut self, runtime: Arc<RuntimeEnv>) -> Self {
         self.runtime = runtime;
         self
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation_token.is_cancelled()
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation_token.cancel();
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.clone()
     }
 }
 
