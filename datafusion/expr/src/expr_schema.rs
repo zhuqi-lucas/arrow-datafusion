@@ -244,8 +244,8 @@ impl ExprSchemable for Expr {
     /// column that does not exist in the schema.
     fn nullable(&self, input_schema: &dyn ExprSchema) -> Result<bool> {
         match self {
-            Expr::Alias(alias_box) => {
-                let Alias { expr, .. } = alias_box.as_ref();
+            Expr::Alias(boxed_alias) => {
+                let Alias { expr, .. } = boxed_alias.as_ref();
                 expr.nullable(input_schema)
             }
             Expr::Not(expr) | Expr::Negative(expr) => expr.nullable(input_schema),

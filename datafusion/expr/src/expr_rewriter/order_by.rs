@@ -137,9 +137,9 @@ fn rewrite_in_terms_of_projection(
 /// so avg(c) as average will match avgc
 fn expr_match(needle: &Expr, expr: &Expr) -> bool {
     // check inside aliases
-    if let Expr::Alias(alias_box) = expr {
-        // alias_box: &Box<Alias>, so alias_box.as_ref() is &Alias
-        let alias: &Alias = alias_box.as_ref();
+    if let Expr::Alias(boxed_alias) = expr {
+        // boxed_alias: &Box<Alias>, so boxed_alias.as_ref() is &Alias
+        let alias: &Alias = boxed_alias.as_ref();
         // alias.expr: Box<Expr>, so alias.expr.as_ref() is &Expr
         alias.expr.as_ref() == needle
     } else {

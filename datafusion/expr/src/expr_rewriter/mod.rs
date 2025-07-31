@@ -174,9 +174,9 @@ pub fn create_col_from_scalar_expr(
     subqry_alias: String,
 ) -> Result<Column> {
     match scalar_expr {
-        Expr::Alias(alias_box) => {
-            // alias_box: &Box<Alias> (if you’re matching on &expr) or Box<Alias>
-            let name = &alias_box.name;
+        Expr::Alias(boxed_alias) => {
+            // boxed_alias: &Box<Alias> (if you’re matching on &expr) or Box<Alias>
+            let name = &boxed_alias.name;
             Ok(Column::new(
                 Some::<TableReference>(subqry_alias.into()),
                 name,
@@ -256,9 +256,9 @@ fn coerce_exprs_for_schema(
             let new_type = dst_schema.field(idx).data_type();
             if new_type != &expr.get_type(src_schema)? {
                 match expr {
-                    Expr::Alias(alias_box) => {
-                        // alias_box: Box<Alias>
-                        let Alias { expr, name, .. } = *alias_box;
+                    Expr::Alias(boxed_alias) => {
+                        // boxed_alias: Box<Alias>
+                        let Alias { expr, name, .. } = *boxed_alias;
                         Ok(expr.cast_to(new_type, src_schema)?.alias(name))
                     }
                     #[expect(deprecated)]

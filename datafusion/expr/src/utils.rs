@@ -971,8 +971,8 @@ pub fn iter_conjunction(expr: &Expr) -> impl Iterator<Item = &Expr> {
                     stack.push(right);
                     stack.push(left);
                 }
-                Expr::Alias(alias_box) => {
-                    stack.push(&*alias_box.expr);
+                Expr::Alias(boxed_alias) => {
+                    stack.push(&*boxed_alias.expr);
                 }
                 other => return Some(other),
             }
@@ -997,7 +997,7 @@ pub fn iter_conjunction_owned(expr: Expr) -> impl Iterator<Item = Expr> {
                     stack.push(*right);
                     stack.push(*left);
                 }
-                Expr::Alias(alias_box) => stack.push(*alias_box.expr),
+                Expr::Alias(boxed_alias) => stack.push(*boxed_alias.expr),
                 other => return Some(other),
             }
         }
