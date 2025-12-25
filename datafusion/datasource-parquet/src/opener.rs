@@ -148,13 +148,19 @@ impl PreparedAccessPlan {
         mut self,
         file_metadata: &parquet::file::metadata::ParquetMetaData,
     ) -> Result<Self> {
+        // Get the row group indexes before reversing
+        let row_groups_to_scan = self.row_group_indexes.clone();
+
         // Reverse the row group indexes
         self.row_group_indexes = self.row_group_indexes.into_iter().rev().collect();
 
         // If we have a row selection, reverse it to match the new row group order
         if let Some(row_selection) = self.row_selection {
-            self.row_selection =
-                Some(reverse_row_selection(&row_selection, file_metadata)?);
+            self.row_selection = Some(reverse_row_selection(
+                &row_selection,
+                file_metadata,
+                &row_groups_to_scan, // Pass the original (non-reversed) row group indexes
+            )?);
         }
 
         Ok(self)
@@ -964,6 +970,7 @@ mod test {
     use std::sync::Arc;
 
     use super::{ConstantColumns, constant_columns_from_stats};
+    use crate::sort::reverse_row_selection;
     use crate::{DefaultParquetFileReaderFactory, opener::ParquetOpener};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use bytes::{BufMut, BytesMut};
@@ -986,6 +993,7 @@ mod test {
     use futures::{Stream, StreamExt};
     use object_store::{ObjectStore, memory::InMemory, path::Path};
     use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
     use parquet::file::properties::WriterProperties;
 
     /// Builder for creating [`ParquetOpener`] instances with sensible defaults for tests.
