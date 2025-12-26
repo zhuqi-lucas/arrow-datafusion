@@ -970,7 +970,6 @@ mod test {
     use std::sync::Arc;
 
     use super::{ConstantColumns, constant_columns_from_stats};
-    use crate::sort::reverse_row_selection;
     use crate::{DefaultParquetFileReaderFactory, opener::ParquetOpener};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use bytes::{BufMut, BytesMut};
@@ -993,7 +992,6 @@ mod test {
     use futures::{Stream, StreamExt};
     use object_store::{ObjectStore, memory::InMemory, path::Path};
     use parquet::arrow::ArrowWriter;
-    use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
     use parquet::file::properties::WriterProperties;
 
     /// Builder for creating [`ParquetOpener`] instances with sensible defaults for tests.
