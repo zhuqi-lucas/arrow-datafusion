@@ -454,16 +454,16 @@ mod tests {
         // This is the key test case for the bug fix
         let metadata = create_test_metadata(vec![100, 100, 100, 100]);
 
-        // Scenario: RG0 (scan all), RG1 (skipped), RG2 (partial), RG3 (scan all)
+        // Scenario: RG0 (scan all), RG1 (completely skipped), RG2 (partial), RG3 (scan all)
         // The row selection only covers RG0, RG2, RG3 (300 rows total)
         let selection = RowSelection::from(vec![
             RowSelector::select(100), // RG0: all 100 rows
-            RowSelector::select(50),  // RG2: first 50 rows
-            RowSelector::skip(50),    // RG2: skip last 50 rows
+            RowSelector::select(25),  // RG2: select first 25 rows
+            RowSelector::skip(75),    // RG2: skip last 75 rows
             RowSelector::select(100), // RG3: all 100 rows
         ]);
 
-        // Only scanning RG0, RG2, RG3 (RG1 is skipped)
+        // Only scanning RG0, RG2, RG3 (RG1 is not in the scan plan)
         let row_groups_to_scan = vec![0, 2, 3];
         let reversed =
             reverse_row_selection(&selection, &metadata, &row_groups_to_scan).unwrap();
@@ -480,28 +480,32 @@ mod tests {
             .map(|s| s.row_count)
             .sum();
 
-        assert_eq!(original_selected, 250); // 100 + 50 + 100
-        assert_eq!(reversed_selected, 250);
+        assert_eq!(original_selected, 225); // 100 + 25 + 100
+        assert_eq!(reversed_selected, 225);
 
         // Verify the reversed selection structure
-        // Should be: RG3 (100), RG2 (50, skip 50), RG0 (100)
+        // After reversal, the order becomes: RG3, RG2, RG0
+        // - RG3: select(100)
+        // - RG2: select(25), skip(75)  (note: internal order preserved, not reversed)
+        // - RG0: select(100)
+        //
+        // After RowSelection::from() merges adjacent selectors of the same type:
+        // - RG3's select(100) + RG2's select(25) = select(125)
+        // - RG2's skip(75) remains as skip(75)
+        // - RG0's select(100) remains as select(100)
         let selectors: Vec<_> = reversed.iter().collect();
-        assert_eq!(selectors.len(), 4);
+        assert_eq!(selectors.len(), 3);
 
-        // RG3: select all
+        // RG3 (100) + RG2 first part (25) merged into select(125)
         assert!(!selectors[0].skip);
-        assert_eq!(selectors[0].row_count, 100);
+        assert_eq!(selectors[0].row_count, 125);
 
-        // RG2: select first 50
-        assert!(!selectors[1].skip);
-        assert_eq!(selectors[1].row_count, 50);
+        // RG2: skip last 75 rows
+        assert!(selectors[1].skip);
+        assert_eq!(selectors[1].row_count, 75);
 
-        // RG2: skip last 50
-        assert!(selectors[2].skip);
-        assert_eq!(selectors[2].row_count, 50);
-
-        // RG0: select all
-        assert!(!selectors[3].skip);
-        assert_eq!(selectors[3].row_count, 100);
+        // RG0: select all 100 rows
+        assert!(!selectors[2].skip);
+        assert_eq!(selectors[2].row_count, 100);
     }
 }
