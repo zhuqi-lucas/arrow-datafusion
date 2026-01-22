@@ -241,6 +241,7 @@ impl JsonOptionsProto {
                 compression: options.compression as i32,
                 schema_infer_max_rec: options.schema_infer_max_rec.map(|v| v as u64),
                 compression_level: options.compression_level,
+                format_array: options.format_array,
             }
         } else {
             JsonOptionsProto::default()
@@ -260,6 +261,7 @@ impl From<&JsonOptionsProto> for JsonOptions {
             },
             schema_infer_max_rec: proto.schema_infer_max_rec.map(|v| v as usize),
             compression_level: proto.compression_level,
+            format_array: proto.format_array,
         }
     }
 }

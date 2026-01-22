@@ -465,6 +465,9 @@ pub struct NdJsonReadOptions<'a> {
     pub infinite: bool,
     /// Indicates how the file is sorted
     pub file_sort_order: Vec<Vec<SortExpr>>,
+    /// Whether the JSON file is in array format `[{...}, {...}]` instead of
+    /// line-delimited format. Defaults to `false`.
+    pub format_array: bool,
 }
 
 impl Default for NdJsonReadOptions<'_> {
@@ -477,6 +480,7 @@ impl Default for NdJsonReadOptions<'_> {
             file_compression_type: FileCompressionType::UNCOMPRESSED,
             infinite: false,
             file_sort_order: vec![],
+            format_array: false,
         }
     }
 }
@@ -527,6 +531,13 @@ impl<'a> NdJsonReadOptions<'a> {
     /// Specify how many rows to read for schema inference
     pub fn schema_infer_max_records(mut self, schema_infer_max_records: usize) -> Self {
         self.schema_infer_max_records = schema_infer_max_records;
+        self
+    }
+
+    /// Specify whether the JSON file is in array format `[{...}, {...}]`
+    /// instead of line-delimited format.
+    pub fn format_array(mut self, format_array: bool) -> Self {
+        self.format_array = format_array;
         self
     }
 }
@@ -663,7 +674,8 @@ impl ReadOptions<'_> for NdJsonReadOptions<'_> {
         let file_format = JsonFormat::default()
             .with_options(table_options.json)
             .with_schema_infer_max_rec(self.schema_infer_max_records)
-            .with_file_compression_type(self.file_compression_type.to_owned());
+            .with_file_compression_type(self.file_compression_type.to_owned())
+            .with_format_array(self.format_array);
 
         ListingOptions::new(Arc::new(file_format))
             .with_file_extension(self.file_extension)
