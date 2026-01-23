@@ -411,8 +411,8 @@ mod tests {
             ]"#,
         )?;
 
-        // Test with format_array = true
-        let format = JsonFormat::default().with_format_array(true);
+        // Test with newline_delimited = false (JSON array format)
+        let format = JsonFormat::default().with_newline_delimited(false);
         let file_schema = format
             .infer_schema(&ctx, &store, &[local_unpartitioned_file(&path)])
             .await
@@ -438,18 +438,14 @@ mod tests {
         let path = format!("{}/empty_array.json", tmp_dir.path().to_string_lossy());
         std::fs::write(&path, "[]")?;
 
-        let format = JsonFormat::default().with_format_array(true);
-        let result = format
+        let format = JsonFormat::default().with_newline_delimited(false);
+        let file_schema = format
             .infer_schema(&ctx, &store, &[local_unpartitioned_file(&path)])
-            .await;
+            .await
+            .expect("Schema inference for empty array");
 
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("JSON array is empty")
-        );
+        // Empty array should return empty schema
+        assert_eq!(file_schema.fields().len(), 0);
 
         Ok(())
     }
@@ -472,7 +468,7 @@ mod tests {
 
         // Only infer from first record
         let format = JsonFormat::default()
-            .with_format_array(true)
+            .with_newline_delimited(false)
             .with_schema_infer_max_rec(1);
 
         let file_schema = format
@@ -510,7 +506,7 @@ mod tests {
         ]"#,
         )?;
 
-        let format = JsonFormat::default().with_format_array(true);
+        let format = JsonFormat::default().with_newline_delimited(false);
 
         // Infer schema
         let file_schema = format
@@ -555,7 +551,7 @@ mod tests {
         let path = format!("{}/array.json", tmp_dir.path().to_string_lossy());
         std::fs::write(&path, r#"[{"a": 1, "b": "hello"}, {"a": 2, "b": "world"}]"#)?;
 
-        let format = JsonFormat::default().with_format_array(true);
+        let format = JsonFormat::default().with_newline_delimited(false);
         let file_schema = format
             .infer_schema(&ctx, &store, &[local_unpartitioned_file(&path)])
             .await?;
@@ -581,7 +577,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ndjson_read_options_format_array() -> Result<()> {
+    async fn test_ndjson_read_options_newline_delimited() -> Result<()> {
         let ctx = SessionContext::new();
 
         // Create a temporary file with JSON array format
@@ -596,8 +592,8 @@ mod tests {
         ]"#,
         )?;
 
-        // Use NdJsonReadOptions with format_array = true
-        let options = NdJsonReadOptions::default().format_array(true);
+        // Use NdJsonReadOptions with newline_delimited = false (JSON array format)
+        let options = NdJsonReadOptions::default().newline_delimited(false);
 
         ctx.register_json("json_array_table", &path, options)
             .await?;
@@ -622,7 +618,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ndjson_read_options_format_array_with_compression() -> Result<()> {
+    async fn test_ndjson_read_options_json_array_with_compression() -> Result<()> {
         use flate2::Compression;
         use flate2::write::GzEncoder;
         use std::io::Write;
@@ -639,9 +635,9 @@ mod tests {
         encoder.write_all(json_content.as_bytes())?;
         encoder.finish()?;
 
-        // Use NdJsonReadOptions with format_array and GZIP compression
+        // Use NdJsonReadOptions with newline_delimited = false and GZIP compression
         let options = NdJsonReadOptions::default()
-            .format_array(true)
+            .newline_delimited(false)
             .file_compression_type(FileCompressionType::GZIP)
             .file_extension(".json.gz");
 
@@ -660,6 +656,281 @@ mod tests {
     | 1 | hello |
     | 2 | world |
     +---+-------+
+    ");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_array_format_with_nested_struct() -> Result<()> {
+        let session = SessionContext::new();
+        let ctx = session.state();
+        let task_ctx = ctx.task_ctx();
+        let store = Arc::new(LocalFileSystem::new()) as _;
+
+        let tmp_dir = tempfile::TempDir::new()?;
+        let path = format!("{}/nested.json", tmp_dir.path().to_string_lossy());
+        std::fs::write(
+            &path,
+            r#"[
+                {"id": 1, "info": {"name": "Alice", "age": 30}},
+                {"id": 2, "info": {"name": "Bob", "age": 25}},
+                {"id": 3, "info": {"name": "Charlie", "age": 35}}
+            ]"#,
+        )?;
+
+        let format = JsonFormat::default().with_newline_delimited(false);
+        let file_schema = format
+            .infer_schema(&ctx, &store, &[local_unpartitioned_file(&path)])
+            .await?;
+
+        // Verify nested struct in schema
+        let info_field = file_schema.field_with_name("info").unwrap();
+        assert!(matches!(info_field.data_type(), DataType::Struct(_)));
+
+        let exec = scan_format(
+            &ctx,
+            &format,
+            Some(file_schema),
+            tmp_dir.path().to_str().unwrap(),
+            "nested.json",
+            None,
+            None,
+        )
+        .await?;
+        let batches = collect(exec, task_ctx).await?;
+
+        assert_eq!(1, batches.len());
+        assert_eq!(3, batches[0].num_rows());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_array_format_with_list() -> Result<()> {
+        let session = SessionContext::new();
+        let ctx = session.state();
+        let task_ctx = ctx.task_ctx();
+        let store = Arc::new(LocalFileSystem::new()) as _;
+
+        let tmp_dir = tempfile::TempDir::new()?;
+        let path = format!("{}/list.json", tmp_dir.path().to_string_lossy());
+        std::fs::write(
+            &path,
+            r#"[
+                {"id": 1, "tags": ["a", "b", "c"]},
+                {"id": 2, "tags": ["d", "e"]},
+                {"id": 3, "tags": ["f"]}
+            ]"#,
+        )?;
+
+        let format = JsonFormat::default().with_newline_delimited(false);
+        let file_schema = format
+            .infer_schema(&ctx, &store, &[local_unpartitioned_file(&path)])
+            .await?;
+
+        // Verify list type in schema
+        let tags_field = file_schema.field_with_name("tags").unwrap();
+        assert!(matches!(tags_field.data_type(), DataType::List(_)));
+
+        let exec = scan_format(
+            &ctx,
+            &format,
+            Some(file_schema),
+            tmp_dir.path().to_str().unwrap(),
+            "list.json",
+            None,
+            None,
+        )
+        .await?;
+        let batches = collect(exec, task_ctx).await?;
+
+        assert_eq!(1, batches.len());
+        assert_eq!(3, batches[0].num_rows());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_array_format_with_list_of_structs() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        let tmp_dir = tempfile::TempDir::new()?;
+        let path = format!("{}/list_struct.json", tmp_dir.path().to_string_lossy());
+        std::fs::write(
+            &path,
+            r#"[
+                {"id": 1, "items": [{"name": "item1", "price": 10.5}, {"name": "item2", "price": 20.0}]},
+                {"id": 2, "items": [{"name": "item3", "price": 15.0}]},
+                {"id": 3, "items": []}
+            ]"#,
+        )?;
+
+        let options = NdJsonReadOptions::default().newline_delimited(false);
+        ctx.register_json("list_struct_table", &path, options)
+            .await?;
+
+        // Query nested struct fields
+        let result = ctx
+            .sql("SELECT id, items FROM list_struct_table ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+
+        assert_eq!(1, result.len());
+        assert_eq!(3, result[0].num_rows());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_array_format_with_unnest() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        let tmp_dir = tempfile::TempDir::new()?;
+        let path = format!("{}/unnest.json", tmp_dir.path().to_string_lossy());
+        std::fs::write(
+            &path,
+            r#"[
+                {"id": 1, "values": [10, 20, 30]},
+                {"id": 2, "values": [40, 50]},
+                {"id": 3, "values": [60]}
+            ]"#,
+        )?;
+
+        let options = NdJsonReadOptions::default().newline_delimited(false);
+        ctx.register_json("unnest_table", &path, options).await?;
+
+        // Test UNNEST on array column
+        let result = ctx
+            .sql(
+                "SELECT id, unnest(values) as value FROM unnest_table ORDER BY id, value",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        assert_snapshot!(batches_to_string(&result), @r"
+    +----+-------+
+    | id | value |
+    +----+-------+
+    | 1  | 10    |
+    | 1  | 20    |
+    | 1  | 30    |
+    | 2  | 40    |
+    | 2  | 50    |
+    | 3  | 60    |
+    +----+-------+
+    ");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_array_format_with_unnest_struct() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        let tmp_dir = tempfile::TempDir::new()?;
+        let path = format!("{}/unnest_struct.json", tmp_dir.path().to_string_lossy());
+        std::fs::write(
+            &path,
+            r#"[{"id": 1, "orders": [{"product": "A", "qty": 2}, {"product": "B", "qty": 3}]}, {"id": 2, "orders": [{"product": "C", "qty": 1}]}]"#,
+        )?;
+
+        let options = NdJsonReadOptions::default().newline_delimited(false);
+        ctx.register_json("unnest_struct_table", &path, options)
+            .await?;
+
+        // Test UNNEST on List<Struct> column and access struct fields
+        let result = ctx
+            .sql(
+                "SELECT id, unnest(orders)['product'] as product, unnest(orders)['qty'] as qty
+                 FROM unnest_struct_table
+                 ORDER BY id, product"
+            )
+            .await?
+            .collect()
+            .await?;
+
+        assert_snapshot!(batches_to_string(&result), @r"
+    +----+---------+-----+
+    | id | product | qty |
+    +----+---------+-----+
+    | 1  | A       | 2   |
+    | 1  | B       | 3   |
+    | 2  | C       | 1   |
+    +----+---------+-----+
+    ");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_array_format_deeply_nested() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        let tmp_dir = tempfile::TempDir::new()?;
+        let path = format!("{}/deep_nested.json", tmp_dir.path().to_string_lossy());
+        std::fs::write(
+            &path,
+            r#"[{"id": 1, "department": {"name": "Engineering", "head": "Alice"}}, {"id": 2, "department": {"name": "Sales", "head": "Bob"}}]"#,
+        )?;
+
+        let options = NdJsonReadOptions::default().newline_delimited(false);
+        ctx.register_json("deep_nested_table", &path, options)
+            .await?;
+
+        // Query nested struct data
+        let result = ctx
+            .sql("SELECT id, department['name'] as dept_name, department['head'] as dept_head FROM deep_nested_table ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+
+        assert_snapshot!(batches_to_string(&result), @r"
+    +----+-------------+-----------+
+    | id | dept_name   | dept_head |
+    +----+-------------+-----------+
+    | 1  | Engineering | Alice     |
+    | 2  | Sales       | Bob       |
+    +----+-------------+-----------+
+    ");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_array_format_with_null_values() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        let tmp_dir = tempfile::TempDir::new()?;
+        let path = format!("{}/nulls.json", tmp_dir.path().to_string_lossy());
+        std::fs::write(
+            &path,
+            r#"[
+                {"id": 1, "name": "Alice", "score": 100},
+                {"id": 2, "name": null, "score": 85},
+                {"id": 3, "name": "Charlie", "score": null}
+            ]"#,
+        )?;
+
+        let options = NdJsonReadOptions::default().newline_delimited(false);
+        ctx.register_json("null_table", &path, options).await?;
+
+        let result = ctx
+            .sql("SELECT id, name, score FROM null_table ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+
+        assert_snapshot!(batches_to_string(&result), @r"
+    +----+---------+-------+
+    | id | name    | score |
+    +----+---------+-------+
+    | 1  | Alice   | 100   |
+    | 2  |         | 85    |
+    | 3  | Charlie |       |
+    +----+---------+-------+
     ");
 
         Ok(())
