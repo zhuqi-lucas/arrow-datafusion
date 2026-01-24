@@ -4718,7 +4718,7 @@ impl<'de> serde::Deserialize<'de> for JsonOptions {
                     compression: compression__.unwrap_or_default(),
                     schema_infer_max_rec: schema_infer_max_rec__,
                     compression_level: compression_level__,
-                    newline_delimited: newline_delimited__.unwrap_or_default(),
+                    newline_delimited: newline_delimited__.unwrap_or(true),
                 })
             }
         }
