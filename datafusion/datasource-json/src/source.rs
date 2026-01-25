@@ -36,7 +36,6 @@ use datafusion_datasource::{
 use datafusion_physical_plan::projection::ProjectionExprs;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
-use arrow::array::RecordBatch;
 use arrow::json::ReaderBuilder;
 use arrow::{datatypes::SchemaRef, json};
 use datafusion_datasource::file::FileSource;
@@ -44,10 +43,14 @@ use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_execution::TaskContext;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 
+use crate::JsonArrayToNdjsonReader;
 use futures::{StreamExt, TryStreamExt};
 use object_store::buffered::BufWriter;
 use object_store::{GetOptions, GetResultPayload, ObjectStore};
 use tokio::io::AsyncWriteExt;
+// ============================================================================
+// JsonOpener and JsonSource
+// ============================================================================
 
 /// A [`FileOpener`] that opens a JSON file and yields a [`FileOpenFuture`]
 pub struct JsonOpener {
@@ -255,21 +258,26 @@ impl FileOpener for JsonOpener {
                     };
 
                     if newline_delimited {
-                        // Newline-delimited JSON (NDJSON) reader
-                        let reader = ReaderBuilder::new(schema)
+                        // NDJSON: use BufReader directly
+                        let reader = BufReader::new(bytes);
+                        let arrow_reader = ReaderBuilder::new(schema)
                             .with_batch_size(batch_size)
-                            .build(BufReader::new(bytes))?;
-                        Ok(futures::stream::iter(reader)
+                            .build(reader)?;
+
+                        Ok(futures::stream::iter(arrow_reader)
                             .map(|r| r.map_err(Into::into))
                             .boxed())
                     } else {
-                        // JSON array format reader
-                        let batches = read_json_array_to_batches(
-                            BufReader::new(bytes),
-                            schema,
-                            batch_size,
-                        )?;
-                        Ok(futures::stream::iter(batches.into_iter().map(Ok)).boxed())
+                        // JSON array format: wrap with streaming converter
+                        // JsonArrayToNdjsonReader implements BufRead
+                        let ndjson_reader = JsonArrayToNdjsonReader::new(bytes);
+                        let arrow_reader = ReaderBuilder::new(schema)
+                            .with_batch_size(batch_size)
+                            .build(ndjson_reader)?;
+
+                        Ok(futures::stream::iter(arrow_reader)
+                            .map(|r| r.map_err(Into::into))
+                            .boxed())
                     }
                 }
                 GetResultPayload::Stream(s) => {
@@ -287,7 +295,9 @@ impl FileOpener for JsonOpener {
                         );
                         Ok(stream.map_err(Into::into).boxed())
                     } else {
-                        // JSON array format: collect all bytes first
+                        // JSON array format from stream: collect bytes first, then use streaming converter
+                        // Note: We still need to collect for streams, but the converter avoids
+                        // additional memory overhead from serde_json parsing
                         let bytes = s
                             .map_err(DataFusionError::from)
                             .try_fold(Vec::new(), |mut acc, chunk| async move {
@@ -295,54 +305,25 @@ impl FileOpener for JsonOpener {
                                 Ok(acc)
                             })
                             .await?;
+
                         let decompressed = file_compression_type
                             .convert_read(std::io::Cursor::new(bytes))?;
-                        let batches = read_json_array_to_batches(
-                            BufReader::new(decompressed),
-                            schema,
-                            batch_size,
-                        )?;
-                        Ok(futures::stream::iter(batches.into_iter().map(Ok)).boxed())
+
+                        // Use streaming converter - it implements BufRead
+                        let ndjson_reader = JsonArrayToNdjsonReader::new(decompressed);
+
+                        let arrow_reader = ReaderBuilder::new(schema)
+                            .with_batch_size(batch_size)
+                            .build(ndjson_reader)?;
+
+                        Ok(futures::stream::iter(arrow_reader)
+                            .map(|r| r.map_err(Into::into))
+                            .boxed())
                     }
                 }
             }
         }))
     }
-}
-
-/// Read JSON array format and convert to RecordBatches.
-///
-/// Parses a JSON array `[{...}, {...}, ...]` and converts each object
-/// to Arrow RecordBatches using the provided schema.
-fn read_json_array_to_batches<R: Read>(
-    mut reader: R,
-    schema: SchemaRef,
-    batch_size: usize,
-) -> Result<Vec<RecordBatch>> {
-    let mut content = String::new();
-    reader.read_to_string(&mut content)?;
-
-    // Parse JSON array
-    let values: Vec<serde_json::Value> = serde_json::from_str(&content)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-    if values.is_empty() {
-        return Ok(vec![RecordBatch::new_empty(schema)]);
-    }
-
-    // Convert to NDJSON string for arrow-json reader
-    let ndjson: String = values
-        .iter()
-        .map(|v| v.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let cursor = std::io::Cursor::new(ndjson);
-    let reader = ReaderBuilder::new(schema)
-        .with_batch_size(batch_size)
-        .build(cursor)?;
-
-    reader.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 pub async fn plan_to_json(

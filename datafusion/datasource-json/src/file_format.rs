@@ -30,14 +30,12 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::json;
-use arrow::json::reader::{
-    ValueIter, infer_json_schema, infer_json_schema_from_iterator,
-};
+use arrow::json::reader::{ValueIter, infer_json_schema_from_iterator};
 use bytes::{Buf, Bytes};
 use datafusion_common::config::{ConfigField, ConfigFileType, JsonOptions};
 use datafusion_common::file_options::json_writer::JsonWriterOptions;
 use datafusion_common::{
-    DEFAULT_JSON_EXTENSION, DataFusionError, GetExt, Result, Statistics, not_impl_err,
+    DEFAULT_JSON_EXTENSION, GetExt, Result, Statistics, not_impl_err,
 };
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_datasource::TableSchema;
@@ -61,6 +59,7 @@ use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion_session::Session;
 
+use crate::JsonArrayToNdjsonReader;
 use async_trait::async_trait;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
 
@@ -152,8 +151,8 @@ impl Debug for JsonFormatFactory {
 /// ]
 /// ```
 ///
-/// Note: JSON array format requires loading the entire file into memory,
-/// which may not be suitable for very large files.
+/// Note: JSON array format is processed using streaming conversion,
+/// which is memory-efficient even for large files.
 #[derive(Debug, Default)]
 pub struct JsonFormat {
     options: JsonOptions,
@@ -211,83 +210,33 @@ impl JsonFormat {
     }
 }
 
-/// Extract JSON records from array format using bracket tracking.
+/// Infer schema from JSON array format using streaming conversion.
 ///
-/// This avoids full JSON parsing by only tracking brace depth to find
-/// record boundaries. Much faster than serde_json::from_str() for large files.
-fn extract_json_records(content: &str) -> Result<Vec<String>> {
-    let content = content.trim();
-    if !content.starts_with('[') || !content.ends_with(']') {
-        return Err(DataFusionError::Execution(
-            "JSON array format must start with '[' and end with ']'".to_string(),
-        ));
-    }
-
-    // Remove outer brackets
-    let inner = &content[1..content.len() - 1];
-    let mut records = Vec::new();
-    let mut depth = 0;
-    let mut in_string = false;
-    let mut escape_next = false;
-    let mut record_start: Option<usize> = None;
-
-    for (i, ch) in inner.char_indices() {
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-
-        match ch {
-            '\\' if in_string => escape_next = true,
-            '"' => in_string = !in_string,
-            '{' if !in_string => {
-                if depth == 0 {
-                    record_start = Some(i);
-                }
-                depth += 1;
-            }
-            '}' if !in_string => {
-                depth -= 1;
-                if depth == 0
-                    && let Some(start) = record_start
-                {
-                    records.push(inner[start..=i].to_string());
-                    record_start = None;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(records)
-}
-
-/// Infer schema from JSON array format content (synchronous version).
+/// This function converts JSON array format to NDJSON on-the-fly and uses
+/// arrow-json's schema inference. It properly tracks the number of records
+/// processed for correct `records_to_read` management.
 ///
-/// This function extracts individual JSON records from array format
-/// and uses arrow-json's schema inference on the extracted records.
-fn infer_schema_from_json_array_content(
-    content: &str,
+/// # Returns
+/// A tuple of (Schema, records_consumed) where records_consumed is the
+/// number of records that were processed for schema inference.
+fn infer_schema_from_json_array<R: Read>(
+    reader: R,
     max_records: usize,
-) -> Result<Schema> {
-    let records = extract_json_records(content)?;
+) -> Result<(Schema, usize)> {
+    let ndjson_reader = JsonArrayToNdjsonReader::new(reader);
 
-    let records_to_infer: Vec<&str> = records
-        .iter()
-        .take(max_records)
-        .map(|s| s.as_str())
-        .collect();
+    let iter = ValueIter::new(ndjson_reader, None);
+    let mut count = 0;
 
-    if records_to_infer.is_empty() {
-        return Ok(Schema::empty());
-    }
+    let schema = infer_json_schema_from_iterator(iter.take_while(|_| {
+        let should_take = count < max_records;
+        if should_take {
+            count += 1;
+        }
+        should_take
+    }))?;
 
-    // Create NDJSON string for arrow-json schema inference
-    let ndjson = records_to_infer.join("\n");
-    let cursor = std::io::Cursor::new(ndjson.as_bytes());
-
-    let (schema, _) = infer_json_schema(cursor, Some(max_records))?;
-    Ok(schema)
+    Ok((schema, count))
 }
 
 #[async_trait]
@@ -327,56 +276,64 @@ impl FileFormat for JsonFormat {
         let newline_delimited = self.options.newline_delimited;
 
         for object in objects {
-            let mut take_while = || {
-                let should_take = records_to_read > 0;
-                if should_take {
-                    records_to_read -= 1;
-                }
-                should_take
-            };
+            // Early exit if we've read enough records
+            if records_to_read == 0 {
+                break;
+            }
 
             let r = store.as_ref().get(&object.location).await?;
-            let schema = match r.payload {
+
+            let (schema, records_consumed) = match r.payload {
                 #[cfg(not(target_arch = "wasm32"))]
                 GetResultPayload::File(file, _) => {
                     let decoder = file_compression_type.convert_read(file)?;
-                    let mut reader = BufReader::new(decoder);
+                    let reader = BufReader::new(decoder);
 
                     if newline_delimited {
-                        let iter = ValueIter::new(&mut reader, None);
-                        infer_json_schema_from_iterator(
-                            iter.take_while(|_| take_while()),
-                        )?
+                        // NDJSON: use ValueIter directly
+                        let iter = ValueIter::new(reader, None);
+                        let mut count = 0;
+                        let schema =
+                            infer_json_schema_from_iterator(iter.take_while(|_| {
+                                let should_take = count < records_to_read;
+                                if should_take {
+                                    count += 1;
+                                }
+                                should_take
+                            }))?;
+                        (schema, count)
                     } else {
-                        // JSON array format: read content and extract records
-                        let mut content = String::new();
-                        reader.read_to_string(&mut content)?;
-                        infer_schema_from_json_array_content(&content, records_to_read)?
+                        // JSON array format: use streaming converter
+                        infer_schema_from_json_array(reader, records_to_read)?
                     }
                 }
                 GetResultPayload::Stream(_) => {
                     let data = r.bytes().await?;
                     let decoder = file_compression_type.convert_read(data.reader())?;
-                    let mut reader = BufReader::new(decoder);
+                    let reader = BufReader::new(decoder);
 
                     if newline_delimited {
-                        let iter = ValueIter::new(&mut reader, None);
-                        infer_json_schema_from_iterator(
-                            iter.take_while(|_| take_while()),
-                        )?
+                        let iter = ValueIter::new(reader, None);
+                        let mut count = 0;
+                        let schema =
+                            infer_json_schema_from_iterator(iter.take_while(|_| {
+                                let should_take = count < records_to_read;
+                                if should_take {
+                                    count += 1;
+                                }
+                                should_take
+                            }))?;
+                        (schema, count)
                     } else {
-                        // JSON array format: read content and extract records
-                        let mut content = String::new();
-                        reader.read_to_string(&mut content)?;
-                        infer_schema_from_json_array_content(&content, records_to_read)?
+                        // JSON array format: use streaming converter
+                        infer_schema_from_json_array(reader, records_to_read)?
                     }
                 }
             };
 
             schemas.push(schema);
-            if records_to_read == 0 {
-                break;
-            }
+            // Correctly decrement records_to_read
+            records_to_read = records_to_read.saturating_sub(records_consumed);
         }
 
         let schema = Schema::try_merge(schemas)?;
