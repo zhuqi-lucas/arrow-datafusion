@@ -4589,7 +4589,7 @@ impl serde::Serialize for JsonOptions {
         if self.compression_level.is_some() {
             len += 1;
         }
-        if self.newline_delimited {
+        if self.newline_delimited.is_some() {
             len += 1;
         }
         let mut struct_ser = serializer.serialize_struct("datafusion_common.JsonOptions", len)?;
@@ -4606,8 +4606,8 @@ impl serde::Serialize for JsonOptions {
         if let Some(v) = self.compression_level.as_ref() {
             struct_ser.serialize_field("compressionLevel", v)?;
         }
-        if self.newline_delimited {
-            struct_ser.serialize_field("newlineDelimited", &self.newline_delimited)?;
+        if let Some(v) = self.newline_delimited.as_ref() {
+            struct_ser.serialize_field("newlineDelimited", v)?;
         }
         struct_ser.end()
     }
@@ -4710,7 +4710,7 @@ impl<'de> serde::Deserialize<'de> for JsonOptions {
                             if newline_delimited__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("newlineDelimited"));
                             }
-                            newline_delimited__ = Some(map_.next_value()?);
+                            newline_delimited__ = map_.next_value()?;
                         }
                     }
                 }
@@ -4718,7 +4718,7 @@ impl<'de> serde::Deserialize<'de> for JsonOptions {
                     compression: compression__.unwrap_or_default(),
                     schema_infer_max_rec: schema_infer_max_rec__,
                     compression_level: compression_level__,
-                    newline_delimited: newline_delimited__.unwrap_or(true),
+                    newline_delimited: newline_delimited__,
                 })
             }
         }

@@ -113,6 +113,8 @@ pub struct JsonArrayToNdjsonReader<R: Read> {
     pos: usize,
     /// Number of valid bytes in the buffer
     filled: usize,
+    /// Whether trailing non-whitespace content was detected after ']'
+    has_trailing_content: bool,
 }
 
 impl<R: Read> JsonArrayToNdjsonReader<R> {
@@ -127,15 +129,19 @@ impl<R: Read> JsonArrayToNdjsonReader<R> {
             buffer: vec![0; DEFAULT_BUF_SIZE],
             pos: 0,
             filled: 0,
+            has_trailing_content: false,
         }
     }
 
     /// Check if the JSON array was properly terminated.
     ///
+    /// This should be called after all data has been read.
+    ///
     /// Returns an error if:
     /// - Unbalanced braces/brackets (depth != 0)
     /// - Unterminated string
     /// - Missing closing `]`
+    /// - Unexpected trailing content after `]`
     pub fn validate_complete(&self) -> std::io::Result<()> {
         if self.depth != 0 {
             return Err(std::io::Error::new(
@@ -152,7 +158,13 @@ impl<R: Read> JsonArrayToNdjsonReader<R> {
         if self.state != JsonArrayState::Done {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Malformed JSON array: missing closing ']'",
+                "Incomplete JSON array: expected closing bracket ']'",
+            ));
+        }
+        if self.has_trailing_content {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Malformed JSON: unexpected trailing content after ']'",
             ));
         }
         Ok(())
@@ -225,43 +237,40 @@ impl<R: Read> JsonArrayToNdjsonReader<R> {
                     }
                 }
             }
-            JsonArrayState::Done => None,
+            JsonArrayState::Done => {
+                // After ']', check for non-whitespace trailing content
+                if !byte.is_ascii_whitespace() {
+                    self.has_trailing_content = true;
+                }
+                None
+            }
         }
     }
 
     /// Fill the internal buffer with transformed data
     fn fill_internal_buffer(&mut self) -> std::io::Result<()> {
-        if self.state == JsonArrayState::Done {
-            return Ok(());
-        }
-
         // Read raw data from inner reader
         let mut raw_buf = vec![0u8; DEFAULT_BUF_SIZE];
         let mut write_pos = 0;
 
         loop {
-            if write_pos >= self.buffer.len() {
-                break;
-            }
-
             let bytes_read = self.inner.read(&mut raw_buf)?;
             if bytes_read == 0 {
                 break; // EOF
             }
 
             for &byte in &raw_buf[..bytes_read] {
-                if self.state == JsonArrayState::Done {
-                    break;
-                }
                 if let Some(transformed) = self.process_byte(byte)
-                    && write_pos < self.buffer.len()
-                {
-                    self.buffer[write_pos] = transformed;
-                    write_pos += 1;
-                }
+                    && write_pos < self.buffer.len() {
+                        self.buffer[write_pos] = transformed;
+                        write_pos += 1;
+                    }
+                // Note: process_byte is called for all bytes to track state,
+                // even when buffer is full or in Done state
             }
 
-            if self.state == JsonArrayState::Done {
+            // Only stop if buffer is full
+            if write_pos >= self.buffer.len() {
                 break;
             }
         }
@@ -385,5 +394,81 @@ mod tests {
         reader.read_to_string(&mut output).unwrap();
         // Top-level whitespace is skipped, internal whitespace preserved
         assert_eq!(output, "{\"a\":1}\n{\"a\":2}");
+    }
+
+    #[test]
+    fn test_validate_complete_valid_json() {
+        let valid_json = r#"[{"a":1},{"a":2}]"#;
+        let mut reader = JsonArrayToNdjsonReader::new(valid_json.as_bytes());
+        let mut output = String::new();
+        reader.read_to_string(&mut output).unwrap();
+        reader.validate_complete().unwrap();
+    }
+
+    #[test]
+    fn test_json_array_with_trailing_junk() {
+        let input = r#" [ {"a":1} , {"a":2} ] some { junk [ here ] "#;
+        let mut reader = JsonArrayToNdjsonReader::new(input.as_bytes());
+        let mut output = String::new();
+        reader.read_to_string(&mut output).unwrap();
+
+        // Should extract the valid array content
+        assert_eq!(output, "{\"a\":1}\n{\"a\":2}");
+
+        // But validation should catch the trailing junk
+        let result = reader.validate_complete();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("trailing content")
+                || err_msg.contains("Unexpected trailing"),
+            "Expected trailing content error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_complete_incomplete_array() {
+        let invalid_json = r#"[{"a":1},{"a":2}"#; // Missing closing ]
+        let mut reader = JsonArrayToNdjsonReader::new(invalid_json.as_bytes());
+        let mut output = String::new();
+        reader.read_to_string(&mut output).unwrap();
+
+        let result = reader.validate_complete();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("expected closing bracket")
+                || err_msg.contains("missing closing"),
+            "Expected missing bracket error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_complete_unbalanced_braces() {
+        let invalid_json = r#"[{"a":1},{"a":2]"#; // Wrong closing bracket
+        let mut reader = JsonArrayToNdjsonReader::new(invalid_json.as_bytes());
+        let mut output = String::new();
+        reader.read_to_string(&mut output).unwrap();
+
+        let result = reader.validate_complete();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unbalanced")
+                || err_msg.contains("expected closing bracket"),
+            "Expected unbalanced or missing bracket error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_complete_valid_with_trailing_whitespace() {
+        let input = r#"[{"a":1},{"a":2}]
+    "#; // Trailing whitespace is OK
+        let mut reader = JsonArrayToNdjsonReader::new(input.as_bytes());
+        let mut output = String::new();
+        reader.read_to_string(&mut output).unwrap();
+
+        // Whitespace after ] should be allowed
+        reader.validate_complete().unwrap();
     }
 }

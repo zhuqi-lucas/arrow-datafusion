@@ -442,16 +442,23 @@ impl<'a> AvroReadOptions<'a> {
     }
 }
 
+#[deprecated(
+    since = "53.0.0",
+    note = "Use `JsonReadOptions` instead. This alias will be removed in a future version."
+)]
+#[doc = "Deprecated: Use [`JsonReadOptions`] instead."]
+pub type NdJsonReadOptions<'a> = JsonReadOptions<'a>;
+
 /// Options that control the reading of JSON files.
 ///
 /// Supports both newline-delimited JSON (NDJSON) and JSON array formats.
 ///
 /// Note this structure is supplied when a datasource is created and
-/// can not not vary from statement to statement. For settings that
+/// can not vary from statement to statement. For settings that
 /// can vary statement to statement see
 /// [`ConfigOptions`](crate::config::ConfigOptions).
 #[derive(Clone)]
-pub struct NdJsonReadOptions<'a> {
+pub struct JsonReadOptions<'a> {
     /// The data source schema.
     pub schema: Option<&'a Schema>,
     /// Max number of rows to read from JSON files for schema inference if needed. Defaults to `DEFAULT_SCHEMA_INFER_MAX_RECORD`.
@@ -485,7 +492,7 @@ pub struct NdJsonReadOptions<'a> {
     pub newline_delimited: bool,
 }
 
-impl Default for NdJsonReadOptions<'_> {
+impl Default for JsonReadOptions<'_> {
     fn default() -> Self {
         Self {
             schema: None,
@@ -500,7 +507,7 @@ impl Default for NdJsonReadOptions<'_> {
     }
 }
 
-impl<'a> NdJsonReadOptions<'a> {
+impl<'a> JsonReadOptions<'a> {
     /// Specify table_partition_cols for partition pruning
     pub fn table_partition_cols(
         mut self,
@@ -693,7 +700,7 @@ impl ReadOptions<'_> for ParquetReadOptions<'_> {
 }
 
 #[async_trait]
-impl ReadOptions<'_> for NdJsonReadOptions<'_> {
+impl ReadOptions<'_> for JsonReadOptions<'_> {
     fn to_listing_options(
         &self,
         config: &SessionConfig,

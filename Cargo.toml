@@ -187,6 +187,8 @@ strum_macros = "0.27.2"
 tempfile = "3"
 testcontainers-modules = { version = "0.14" }
 tokio = { version = "1.48", features = ["macros", "rt", "sync"] }
+tokio-util = "0.7"
+tokio-stream = "0.1"
 url = "2.5.7"
 zstd = { version = "0.13", default-features = false }
 

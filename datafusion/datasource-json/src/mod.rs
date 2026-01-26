@@ -26,4 +26,3 @@ pub mod source;
 pub mod utils;
 
 pub use file_format::*;
-pub use utils::JsonArrayToNdjsonReader;

@@ -3080,9 +3080,6 @@ config_namespace! {
        ///   {"key1": 2, "key2": "vals"}
        /// ]
        /// ```
-       ///
-       /// Note: JSON array format requires loading the entire file into memory.
-       /// For large files, newline-delimited format is recommended.
         pub newline_delimited: bool, default = true
     }
 }

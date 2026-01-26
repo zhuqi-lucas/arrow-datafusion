@@ -25,7 +25,7 @@ mod tests {
     use super::*;
 
     use crate::datasource::file_format::test_util::scan_format;
-    use crate::prelude::{NdJsonReadOptions, SessionConfig, SessionContext};
+    use crate::prelude::{SessionConfig, SessionContext};
     use crate::test::object_store::local_unpartitioned_file;
     use arrow::array::RecordBatch;
     use arrow_schema::Schema;
@@ -46,6 +46,7 @@ mod tests {
     use datafusion_common::internal_err;
     use datafusion_common::stats::Precision;
 
+    use crate::execution::options::JsonReadOptions;
     use datafusion_common::Result;
     use datafusion_datasource::file_compression_type::FileCompressionType;
     use futures::StreamExt;
@@ -53,7 +54,6 @@ mod tests {
     use object_store::local::LocalFileSystem;
     use regex::Regex;
     use rstest::rstest;
-
     // ==================== Test Helpers ====================
 
     /// Create a temporary JSON file and return (TempDir, path)
@@ -82,7 +82,7 @@ mod tests {
     async fn query_json_array(content: &str, query: &str) -> Result<Vec<RecordBatch>> {
         let (_tmp_dir, path) = create_temp_json(content);
         let ctx = SessionContext::new();
-        let options = NdJsonReadOptions::default().newline_delimited(false);
+        let options = JsonReadOptions::default().newline_delimited(false);
         ctx.register_json("test_table", &path, options).await?;
         ctx.sql(query).await?.collect().await
     }
@@ -250,7 +250,7 @@ mod tests {
         let ctx = SessionContext::new_with_config(config);
 
         let table_path = "tests/data/1.json";
-        let options = NdJsonReadOptions::default();
+        let options = JsonReadOptions::default();
 
         ctx.register_json("json_parallel", table_path, options)
             .await?;
@@ -282,7 +282,7 @@ mod tests {
         let ctx = SessionContext::new_with_config(config);
 
         let table_path = "tests/data/empty.json";
-        let options = NdJsonReadOptions::default();
+        let options = JsonReadOptions::default();
 
         ctx.register_json("json_parallel_empty", table_path, options)
             .await?;
@@ -596,7 +596,7 @@ mod tests {
         encoder.finish()?;
 
         let ctx = SessionContext::new();
-        let options = NdJsonReadOptions::default()
+        let options = JsonReadOptions::default()
             .newline_delimited(false)
             .file_compression_type(FileCompressionType::GZIP)
             .file_extension(".json.gz");

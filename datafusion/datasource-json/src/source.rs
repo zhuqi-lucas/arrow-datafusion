@@ -23,9 +23,10 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use crate::file_format::JsonDecoder;
+use crate::utils::JsonArrayToNdjsonReader;
 
 use datafusion_common::error::{DataFusionError, Result};
-use datafusion_common_runtime::JoinSet;
+use datafusion_common_runtime::{JoinSet, SpawnedTask};
 use datafusion_datasource::decoder::{DecoderDeserializer, deserialize_stream};
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
@@ -43,11 +44,13 @@ use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_execution::TaskContext;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 
-use crate::JsonArrayToNdjsonReader;
 use futures::{StreamExt, TryStreamExt};
 use object_store::buffered::BufWriter;
 use object_store::{GetOptions, GetResultPayload, ObjectStore};
 use tokio::io::AsyncWriteExt;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::{StreamReader, SyncIoBridge};
+
 // ============================================================================
 // JsonOpener and JsonSource
 // ============================================================================
@@ -295,28 +298,36 @@ impl FileOpener for JsonOpener {
                         );
                         Ok(stream.map_err(Into::into).boxed())
                     } else {
-                        // JSON array format from stream: collect bytes first, then use streaming converter
-                        // Note: We still need to collect for streams, but the converter avoids
-                        // additional memory overhead from serde_json parsing
-                        let bytes = s
-                            .map_err(DataFusionError::from)
-                            .try_fold(Vec::new(), |mut acc, chunk| async move {
-                                acc.extend_from_slice(&chunk);
-                                Ok(acc)
-                            })
-                            .await?;
+                        // JSON array format: streaming conversion without loading entire file
+                        let s = s.map_err(DataFusionError::from);
+                        let decompressed_stream =
+                            file_compression_type.convert_stream(s.boxed())?;
 
-                        let decompressed = file_compression_type
-                            .convert_read(std::io::Cursor::new(bytes))?;
+                        // Convert async stream to sync reader for JsonArrayToNdjsonReader
+                        let stream_reader =
+                            StreamReader::new(decompressed_stream.map_err(|e| {
+                                std::io::Error::other(e)
+                            }));
+                        let sync_reader = SyncIoBridge::new(stream_reader);
 
-                        // Use streaming converter - it implements BufRead
-                        let ndjson_reader = JsonArrayToNdjsonReader::new(decompressed);
+                        // Use streaming converter - processes data in chunks without loading entire file
+                        let ndjson_reader = JsonArrayToNdjsonReader::new(sync_reader);
 
                         let arrow_reader = ReaderBuilder::new(schema)
                             .with_batch_size(batch_size)
                             .build(ndjson_reader)?;
 
-                        Ok(futures::stream::iter(arrow_reader)
+                        // Process arrow reader in blocking task to avoid blocking async executor
+                        let (tx, rx) = tokio::sync::mpsc::channel(2);
+                        SpawnedTask::spawn_blocking(move || {
+                            for batch_result in arrow_reader {
+                                if tx.blocking_send(batch_result).is_err() {
+                                    break; // Receiver dropped
+                                }
+                            }
+                        });
+
+                        Ok(ReceiverStream::new(rx)
                             .map(|r| r.map_err(Into::into))
                             .boxed())
                     }

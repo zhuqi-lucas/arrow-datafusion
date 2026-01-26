@@ -59,7 +59,7 @@ use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion_session::Session;
 
-use crate::JsonArrayToNdjsonReader;
+use crate::utils::JsonArrayToNdjsonReader;
 use async_trait::async_trait;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
 
