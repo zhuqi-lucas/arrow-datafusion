@@ -261,10 +261,11 @@ impl<R: Read> JsonArrayToNdjsonReader<R> {
 
             for &byte in &raw_buf[..bytes_read] {
                 if let Some(transformed) = self.process_byte(byte)
-                    && write_pos < self.buffer.len() {
-                        self.buffer[write_pos] = transformed;
-                        write_pos += 1;
-                    }
+                    && write_pos < self.buffer.len()
+                {
+                    self.buffer[write_pos] = transformed;
+                    write_pos += 1;
+                }
                 // Note: process_byte is called for all bytes to track state,
                 // even when buffer is full or in Done state
             }

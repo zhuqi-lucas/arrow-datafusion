@@ -304,10 +304,9 @@ impl FileOpener for JsonOpener {
                             file_compression_type.convert_stream(s.boxed())?;
 
                         // Convert async stream to sync reader for JsonArrayToNdjsonReader
-                        let stream_reader =
-                            StreamReader::new(decompressed_stream.map_err(|e| {
-                                std::io::Error::other(e)
-                            }));
+                        let stream_reader = StreamReader::new(
+                            decompressed_stream.map_err(|e| std::io::Error::other(e)),
+                        );
                         let sync_reader = SyncIoBridge::new(stream_reader);
 
                         // Use streaming converter - processes data in chunks without loading entire file
