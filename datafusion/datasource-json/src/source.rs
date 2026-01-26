@@ -305,7 +305,7 @@ impl FileOpener for JsonOpener {
 
                         // Convert async stream to sync reader for JsonArrayToNdjsonReader
                         let stream_reader = StreamReader::new(
-                            decompressed_stream.map_err(|e| std::io::Error::other(e)),
+                            decompressed_stream.map_err(DataFusionError::from),
                         );
                         let sync_reader = SyncIoBridge::new(stream_reader);
 
