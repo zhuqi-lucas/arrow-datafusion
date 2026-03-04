@@ -152,11 +152,6 @@ pub struct FileScanConfig {
     /// The maximum number of records to read from this plan. If `None`,
     /// all records after filtering are returned.
     pub limit: Option<usize>,
-    /// Whether the scan's limit is order sensitive
-    /// When `true`, files must be read in the exact order specified to produce
-    /// correct results (e.g., for `ORDER BY ... LIMIT` queries). When `false`,
-    /// DataFusion may reorder file processing for optimization without affecting correctness.
-    pub preserve_order: bool,
     /// All equivalent lexicographical orderings that describe the schema.
     pub output_ordering: Vec<LexOrdering>,
     /// File compression type
@@ -285,15 +280,6 @@ impl FileScanConfigBuilder {
     /// all records after filtering are returned.
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.limit = limit;
-        self
-    }
-
-    /// Set whether the limit should be order-sensitive.
-    /// When `true`, files must be read in the exact order specified to produce
-    /// correct results (e.g., for `ORDER BY ... LIMIT` queries). When `false`,
-    /// DataFusion may reorder file processing for optimization without affecting correctness.
-    pub fn with_preserve_order(mut self, order_sensitive: bool) -> Self {
-        self.preserve_order = order_sensitive;
         self
     }
 
@@ -481,9 +467,6 @@ impl FileScanConfigBuilder {
         let file_compression_type =
             file_compression_type.unwrap_or(FileCompressionType::UNCOMPRESSED);
 
-        // If there is an output ordering, we should preserve it.
-        let preserve_order = preserve_order || !output_ordering.is_empty();
-
         FileScanConfig {
             object_store_url,
             file_source,
@@ -502,7 +485,6 @@ impl FileScanConfigBuilder {
 
 impl From<FileScanConfig> for FileScanConfigBuilder {
     fn from(config: FileScanConfig) -> Self {
-        let projection_indices = config.projection_indices();
         Self {
             object_store_url: config.object_store_url,
             file_source: Arc::<dyn FileSource>::clone(&config.file_source),

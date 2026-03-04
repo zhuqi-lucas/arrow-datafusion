@@ -75,9 +75,7 @@ pub(super) struct ParquetOpener {
     /// Target number of rows in each output RecordBatch
     pub batch_size: usize,
     /// Optional limit on the number of rows to read
-    pub(crate) limit: Option<usize>,
-    /// If should keep the output rows in order
-    pub preserve_order: bool,
+    pub limit: Option<usize>,
     /// Optional predicate to apply during the scan
     pub predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Table schema, including partition columns.
@@ -274,7 +272,6 @@ impl FileOpener for ParquetOpener {
         #[cfg(feature = "parquet_encryption")]
         let encryption_context = self.get_encryption_context();
         let max_predicate_cache_size = self.max_predicate_cache_size;
-        let preserve_order = self.preserve_order;
 
         let reverse_row_groups = self.reverse_row_groups;
         Ok(Box::pin(async move {
@@ -526,8 +523,8 @@ impl FileOpener for ParquetOpener {
                     .add_matched(n_remaining_row_groups);
             }
 
-            // Prune by limit if limit is set and limit order is not sensitive
-            if let (Some(limit), false) = (limit, preserve_order) {
+            // Prune by limit
+            if let Some(limit) = limit {
                 row_groups.prune_by_limit(limit, rg_metadata, &file_metrics);
             }
 

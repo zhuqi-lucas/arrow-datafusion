@@ -240,7 +240,7 @@ impl ExecutionPlan for WorkTableExec {
         node_id: usize,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let mut new_plan =
-            WorkTableExec::new(self.name.clone(), Arc::clone(&self.schema));
+            WorkTableExec::new(self.name.clone(), Arc::clone(&self.schema), self.projection.clone())?;
         let new_props = new_plan.cache.clone().with_node_id(node_id);
         new_plan.cache = new_props;
         Ok(Some(Arc::new(new_plan)))
