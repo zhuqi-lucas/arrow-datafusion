@@ -43,7 +43,7 @@ use datafusion_expr::{
 
 use crate::optimizer::ApplyOrder;
 use crate::utils::{has_all_column_refs, is_restrict_null_predicate};
-use crate::{simplify_expressions::simplify_predicates, OptimizerConfig, OptimizerRule};
+use crate::{OptimizerConfig, OptimizerRule, simplify_expressions::simplify_predicates};
 
 /// Optimizer rule for pushing (moving) filter expressions down in a plan so
 /// they are applied as early as possible.

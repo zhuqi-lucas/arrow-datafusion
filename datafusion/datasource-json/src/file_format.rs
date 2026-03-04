@@ -377,7 +377,10 @@ impl FileFormat for JsonFormat {
     }
 
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
-        Arc::new(JsonSource::new(table_schema).with_newline_delimited(self.options.newline_delimited))
+        Arc::new(
+            JsonSource::new(table_schema)
+                .with_newline_delimited(self.options.newline_delimited),
+        )
     }
 }
 

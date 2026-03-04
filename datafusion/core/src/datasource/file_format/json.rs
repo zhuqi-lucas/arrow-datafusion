@@ -583,8 +583,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_json_array_with_compression() -> Result<()> {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         let tmp_dir = tempfile::TempDir::new()?;

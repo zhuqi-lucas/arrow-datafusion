@@ -1035,7 +1035,7 @@ fn add_merge_on_top(
 /// ```text
 /// "DataSourceExec: file_groups={2 groups: \[\[x], \[y]]}, projection=\[a, b, c, d, e], output_ordering=\[a@0 ASC], file_type=parquet",
 /// ```
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 fn remove_dist_changing_operators(
     mut distribution_context: DistributionContext,
 ) -> Result<(
@@ -1049,14 +1049,14 @@ fn remove_dist_changing_operators(
         || is_coalesce_partitions(&distribution_context.plan)
         || is_sort_preserving_merge(&distribution_context.plan)
     {
-        if is_sort_preserving_merge(&distribution_context.plan) {
-            if let Some(child_fetch) = distribution_context.plan.fetch() {
-                if fetch.is_none() {
-                    fetch = Some(child_fetch);
-                    spm = Some(distribution_context.plan);
-                } else {
-                    fetch = Some(fetch.unwrap().min(child_fetch));
-                }
+        if is_sort_preserving_merge(&distribution_context.plan)
+            && let Some(child_fetch) = distribution_context.plan.fetch()
+        {
+            if fetch.is_none() {
+                fetch = Some(child_fetch);
+                spm = Some(distribution_context.plan);
+            } else {
+                fetch = Some(fetch.unwrap().min(child_fetch));
             }
         }
         // All of above operators have a single child. First child is only child.
@@ -1086,7 +1086,6 @@ fn remove_dist_changing_operators(
 /// "    RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=2",
 /// "      DataSourceExec: file_groups={2 groups: \[\[x], \[y]]}, projection=\[a, b, c, d, e], output_ordering=\[a@0 ASC], file_type=parquet",
 /// ```
-#[allow(clippy::type_complexity)]
 pub fn replace_order_preserving_variants(
     mut context: DistributionContext,
     ordering_satisfied: bool,

@@ -69,10 +69,10 @@ use datafusion_physical_expr::create_physical_expr;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_optimizer::optimizer::PhysicalOptimizer;
-use datafusion_physical_plan::node_id::{
-    annotate_node_id_for_execution_plan, NodeIdAnnotator,
-};
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::node_id::{
+    NodeIdAnnotator, annotate_node_id_for_execution_plan,
+};
 use datafusion_session::Session;
 #[cfg(feature = "sql")]
 use datafusion_sql::{

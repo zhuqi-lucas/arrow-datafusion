@@ -33,10 +33,10 @@ use arrow::datatypes::{Fields, TimeUnit};
 use datafusion::physical_expr::aggregate::AggregateExprBuilder;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::metrics::MetricType;
-use datafusion_datasource::TableSchema;
 use datafusion::physical_plan::node_id::{
-    annotate_node_id_for_execution_plan, NodeIdAnnotator,
+    NodeIdAnnotator, annotate_node_id_for_execution_plan,
 };
+use datafusion_datasource::TableSchema;
 use datafusion_expr::dml::InsertOp;
 use datafusion_functions_aggregate::approx_percentile_cont::approx_percentile_cont_udaf;
 use datafusion_functions_aggregate::array_agg::array_agg_udaf;
