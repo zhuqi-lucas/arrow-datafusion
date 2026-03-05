@@ -467,6 +467,7 @@ impl ExecutionPlan for FilterExec {
         let mut new_plan =
             FilterExec::try_new(Arc::clone(&self.predicate), Arc::clone(self.input()))?
                 .with_projection(self.projection.clone())?;
+        new_plan.fetch = self.fetch;
         let new_props = new_plan.cache.clone().with_node_id(node_id);
         new_plan.cache = new_props;
         Ok(Some(Arc::new(new_plan)))
