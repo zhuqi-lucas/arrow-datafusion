@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::common::{exec_datafusion_err, Result};
+use datafusion::common::{Result, exec_datafusion_err};
 use itertools::Itertools;
 use log::Level::Warn;
 use log::{info, log_enabled, warn};
@@ -125,7 +125,7 @@ pub fn df_value_validator(
             warn!("[{i}] {}<eol>", normalized_actual[i]);
             warn!(
                 "[{i}] {}<eol>",
-                if normalized_expected.len() >= i {
+                if normalized_expected.len() > i {
                     &normalized_expected[i]
                 } else {
                     "No more results"

@@ -19,7 +19,7 @@ use arrow::array::{new_null_array, BooleanArray};
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{and, is_not_null, is_null};
 use arrow::datatypes::{DataType, Field, FieldRef};
-use datafusion_common::{exec_err, internal_err, Result};
+use datafusion_common::{Result, exec_err, internal_err, plan_err};
 use datafusion_expr::binary::try_type_union_resolution;
 use datafusion_expr::{
     ColumnarValue, Documentation, ReturnFieldArgs, ScalarFunctionArgs,

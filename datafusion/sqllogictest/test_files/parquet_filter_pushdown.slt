@@ -95,10 +95,9 @@ logical_plan
 physical_plan
 01)SortPreservingMergeExec: [a@0 ASC NULLS LAST]
 02)--SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
-03)----CoalesceBatchesExec: target_batch_size=8192
-04)------FilterExec: b@1 > 2, projection=[a@0]
-05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=2
-06)----------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/2.parquet]]}, projection=[a, b], file_type=parquet, predicate=b@1 > 2, pruning_predicate=b_null_count@1 != row_count@2 AND b_max@0 > 2, required_guarantees=[]
+03)----FilterExec: b@1 > 2, projection=[a@0]
+04)------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=2
+05)--------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/2.parquet]]}, projection=[a, b], file_type=parquet, predicate=b@1 > 2, pruning_predicate=b_null_count@1 != row_count@2 AND b_max@0 > 2, required_guarantees=[]
 
 query TT
 EXPLAIN select a from t_pushdown where b > 2 ORDER BY a;
@@ -133,11 +132,9 @@ logical_plan
 04)------TableScan: t projection=[a, b], partial_filters=[t.b = Int32(2)]
 physical_plan
 01)CoalescePartitionsExec
-02)--ProjectionExec: expr=[a@0 as a]
-03)----CoalesceBatchesExec: target_batch_size=8192
-04)------FilterExec: b@1 = 2
-05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=2
-06)----------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/2.parquet]]}, projection=[a, b], file_type=parquet, predicate=b@1 = 2, pruning_predicate=b_null_count@2 != row_count@3 AND b_min@0 <= 2 AND 2 <= b_max@1, required_guarantees=[b in (2)]
+02)--FilterExec: b@1 = 2, projection=[a@0]
+03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=2
+04)------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/2.parquet]]}, projection=[a, b], file_type=parquet, predicate=b@1 = 2, pruning_predicate=b_null_count@2 != row_count@3 AND b_min@0 <= 2 AND 2 <= b_max@1, required_guarantees=[b in (2)]
 
 query TT
 EXPLAIN select a from t_pushdown where b = 2 ORDER BY b;
@@ -266,10 +263,9 @@ logical_plan
 physical_plan
 01)SortPreservingMergeExec: [a@0 ASC NULLS LAST]
 02)--SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
-03)----CoalesceBatchesExec: target_batch_size=8192
-04)------FilterExec: b@1 > 2, projection=[a@0]
-05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=2
-06)----------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/2.parquet]]}, projection=[a, b], file_type=parquet, predicate=b@1 > 2, pruning_predicate=b_null_count@1 != row_count@2 AND b_max@0 > 2, required_guarantees=[]
+03)----FilterExec: b@1 > 2, projection=[a@0]
+04)------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=2
+05)--------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/2.parquet]]}, projection=[a, b], file_type=parquet, predicate=b@1 > 2, pruning_predicate=b_null_count@1 != row_count@2 AND b_max@0 > 2, required_guarantees=[]
 
 query TT
 EXPLAIN select a from t_pushdown where b > 2 ORDER BY a;
@@ -304,11 +300,9 @@ logical_plan
 04)------TableScan: t projection=[a, b], partial_filters=[t.b = Int32(2)]
 physical_plan
 01)CoalescePartitionsExec
-02)--ProjectionExec: expr=[a@0 as a]
-03)----CoalesceBatchesExec: target_batch_size=8192
-04)------FilterExec: b@1 = 2
-05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=2
-06)----------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/2.parquet]]}, projection=[a, b], file_type=parquet, predicate=b@1 = 2, pruning_predicate=b_null_count@2 != row_count@3 AND b_min@0 <= 2 AND 2 <= b_max@1, required_guarantees=[b in (2)]
+02)--FilterExec: b@1 = 2, projection=[a@0]
+03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=2
+04)------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/2.parquet]]}, projection=[a, b], file_type=parquet, predicate=b@1 = 2, pruning_predicate=b_null_count@2 != row_count@3 AND b_min@0 <= 2 AND 2 <= b_max@1, required_guarantees=[b in (2)]
 
 query TT
 EXPLAIN select a from t_pushdown where b = 2 ORDER BY b;
@@ -344,10 +338,9 @@ logical_plan
 physical_plan
 01)SortPreservingMergeExec: [a@0 ASC NULLS LAST]
 02)--SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
-03)----CoalesceBatchesExec: target_batch_size=8192
-04)------FilterExec: b@1 > 2, projection=[a@0]
-05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=2
-06)----------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/2.parquet]]}, projection=[a, b], file_type=parquet, predicate=b@1 > 2, pruning_predicate=b_null_count@1 != row_count@2 AND b_max@0 > 2, required_guarantees=[]
+03)----FilterExec: b@1 > 2, projection=[a@0]
+04)------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=2
+05)--------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/2.parquet]]}, projection=[a, b], file_type=parquet, predicate=b@1 > 2, pruning_predicate=b_null_count@1 != row_count@2 AND b_max@0 > 2, required_guarantees=[]
 
 query T
 select a from t_pushdown where b = 2 ORDER BY b;
@@ -416,9 +409,8 @@ logical_plan
 02)--Filter: CAST(t_pushdown.b AS Float64) > random()
 03)----TableScan: t_pushdown projection=[a, b]
 physical_plan
-01)CoalesceBatchesExec: target_batch_size=8192
-02)--FilterExec: CAST(b@1 AS Float64) > random(), projection=[a@0]
-03)----DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/2.parquet]]}, projection=[a, b], file_type=parquet
+01)FilterExec: CAST(b@1 AS Float64) > random(), projection=[a@0]
+02)--DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_filter_pushdown/parquet_table/2.parquet]]}, projection=[a, b], file_type=parquet
 
 ## cleanup
 statement ok
@@ -571,3 +563,103 @@ ORDER BY start_timestamp, trace_id
 LIMIT 1;
 ----
 2024-10-01T00:00:00
+
+
+statement ok
+set datafusion.execution.parquet.pushdown_filters = false;
+
+# Regression test for https://github.com/apache/datafusion/issues/20696
+# Multi-column INNER JOIN with dictionary fails
+# when parquet pushdown filters are enabled.
+
+statement ok
+COPY (
+  SELECT
+    to_timestamp_nanos(time_ns) AS time,
+    arrow_cast(state, 'Dictionary(Int32, Utf8)') AS state,
+    arrow_cast(city, 'Dictionary(Int32, Utf8)') AS city,
+    temp
+  FROM (
+    VALUES
+      (200, 'CA', 'LA', 90.0),
+      (250, 'MA', 'Boston', 72.4),
+      (100, 'MA', 'Boston', 70.4),
+      (350, 'CA', 'LA', 90.0)
+  ) AS t(time_ns, state, city, temp)
+)
+TO 'test_files/scratch/parquet_filter_pushdown/issue_20696/h2o/data.parquet';
+
+statement ok
+COPY (
+  SELECT
+    to_timestamp_nanos(time_ns) AS time,
+    arrow_cast(state, 'Dictionary(Int32, Utf8)') AS state,
+    arrow_cast(city, 'Dictionary(Int32, Utf8)') AS city,
+    temp,
+    reading
+  FROM (
+    VALUES
+      (250, 'MA', 'Boston', 53.4, 51.0),
+      (100, 'MA', 'Boston', 50.4, 50.0)
+  ) AS t(time_ns, state, city, temp, reading)
+)
+TO 'test_files/scratch/parquet_filter_pushdown/issue_20696/o2/data.parquet';
+
+statement ok
+CREATE EXTERNAL TABLE h2o_parquet_20696 STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet_filter_pushdown/issue_20696/h2o/';
+
+statement ok
+CREATE EXTERNAL TABLE o2_parquet_20696 STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet_filter_pushdown/issue_20696/o2/';
+
+# Query should work both with and without filters
+statement ok
+set datafusion.execution.parquet.pushdown_filters = false;
+
+query RRR
+SELECT
+  h2o_parquet_20696.temp AS h2o_temp,
+  o2_parquet_20696.temp AS o2_temp,
+  o2_parquet_20696.reading
+FROM h2o_parquet_20696
+INNER JOIN o2_parquet_20696
+  ON h2o_parquet_20696.time = o2_parquet_20696.time
+  AND h2o_parquet_20696.state = o2_parquet_20696.state
+  AND h2o_parquet_20696.city = o2_parquet_20696.city
+WHERE h2o_parquet_20696.time >= '1970-01-01T00:00:00.000000050Z'
+  AND h2o_parquet_20696.time <= '1970-01-01T00:00:00.000000300Z';
+----
+72.4 53.4 51
+70.4 50.4 50
+
+
+statement ok
+set datafusion.execution.parquet.pushdown_filters = true;
+
+query RRR
+SELECT
+  h2o_parquet_20696.temp AS h2o_temp,
+  o2_parquet_20696.temp AS o2_temp,
+  o2_parquet_20696.reading
+FROM h2o_parquet_20696
+INNER JOIN o2_parquet_20696
+  ON h2o_parquet_20696.time = o2_parquet_20696.time
+  AND h2o_parquet_20696.state = o2_parquet_20696.state
+  AND h2o_parquet_20696.city = o2_parquet_20696.city
+WHERE h2o_parquet_20696.time >= '1970-01-01T00:00:00.000000050Z'
+  AND h2o_parquet_20696.time <= '1970-01-01T00:00:00.000000300Z';
+----
+72.4 53.4 51
+70.4 50.4 50
+
+# Cleanup
+statement ok
+DROP TABLE h2o_parquet_20696;
+
+statement ok
+DROP TABLE o2_parquet_20696;
+
+# Cleanup settings
+statement ok
+set datafusion.execution.parquet.pushdown_filters = false;

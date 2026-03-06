@@ -20,7 +20,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use arrow::array::{ArrayRef, Int64Array, Int8Array, StringArray};
+use arrow::array::{ArrayRef, Int8Array, Int64Array, StringArray};
 use arrow::datatypes::{Field, Schema, SchemaBuilder};
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::listing::PartitionedFile;
@@ -31,8 +31,8 @@ use datafusion::datasource::physical_plan::{
 use datafusion::physical_plan::collect;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::prelude::SessionContext;
-use datafusion_common::test_util::batches_to_sort_string;
 use datafusion_common::Result;
+use datafusion_common::test_util::batches_to_sort_string;
 
 use bytes::Bytes;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
@@ -44,9 +44,9 @@ use insta::assert_snapshot;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore};
+use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::AsyncFileReader;
-use parquet::arrow::ArrowWriter;
 use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaData;
 
@@ -80,7 +80,7 @@ async fn route_data_access_ops_to_parquet_file_reader_factory() {
         .collect();
 
     let source = Arc::new(
-        ParquetSource::default()
+        ParquetSource::new(file_schema.clone())
             // prepare the scan
             .with_parquet_file_reader_factory(Arc::new(
                 InMemoryParquetFileReaderFactory(Arc::clone(&in_memory_object_store)),
@@ -89,7 +89,6 @@ async fn route_data_access_ops_to_parquet_file_reader_factory() {
     let base_config = FileScanConfigBuilder::new(
         // just any url that doesn't point to in memory object store
         ObjectStoreUrl::local_filesystem(),
-        file_schema,
         source,
     )
     .with_file_group(file_group)

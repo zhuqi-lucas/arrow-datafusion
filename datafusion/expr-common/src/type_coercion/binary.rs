@@ -22,18 +22,20 @@ use std::sync::Arc;
 
 use crate::operator::Operator;
 
-use arrow::array::{new_empty_array, Array};
+use arrow::array::{Array, new_empty_array};
 use arrow::compute::can_cast_types;
+use arrow::datatypes::IntervalUnit::MonthDayNano;
+use arrow::datatypes::TimeUnit::*;
 use arrow::datatypes::{
-    DataType, Field, FieldRef, Fields, TimeUnit, DECIMAL128_MAX_PRECISION,
-    DECIMAL128_MAX_SCALE, DECIMAL256_MAX_PRECISION, DECIMAL256_MAX_SCALE,
     DECIMAL32_MAX_PRECISION, DECIMAL32_MAX_SCALE, DECIMAL64_MAX_PRECISION,
-    DECIMAL64_MAX_SCALE,
+    DECIMAL64_MAX_SCALE, DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE,
+    DECIMAL256_MAX_PRECISION, DECIMAL256_MAX_SCALE, DataType, Field, FieldRef, Fields,
+    TimeUnit,
 };
 use datafusion_common::types::NativeType;
 use datafusion_common::{
-    exec_err, internal_err, not_impl_err, plan_datafusion_err, plan_err, Diagnostic,
-    Result, Span, Spans,
+    Diagnostic, Result, Span, Spans, exec_err, internal_err, not_impl_err,
+    plan_datafusion_err, plan_err,
 };
 use itertools::Itertools;
 
@@ -184,8 +186,8 @@ impl<'a> BinaryTypeCoercer<'a> {
     }
 
     fn signature_inner(&'a self, lhs: &DataType, rhs: &DataType) -> Result<Signature> {
-        use arrow::datatypes::DataType::*;
         use Operator::*;
+        use arrow::datatypes::DataType::*;
         let result = match self.op {
         Eq |
         NotEq |
@@ -264,6 +266,18 @@ impl<'a> BinaryTypeCoercer<'a> {
                 Ok(Signature{
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
+                    ret,
+                })
+            } else if let Some((lhs, rhs)) = temporal_math_coercion(lhs, rhs) {
+                // Temporal arithmetic, e.g. Date32 + int64, Timestamp + duration, etc
+                let ret = self.get_result(&lhs, &rhs).map_err(|e| {
+                    plan_datafusion_err!(
+                        "Cannot get result type for temporal operation {} {} {}: {e}", self.lhs, self.op, self.rhs
+                    )
+                })?;
+                Ok(Signature {
+                    lhs,
+                    rhs,
                     ret,
                 })
             } else if let Some(coerced) = temporal_coercion_strict_timezone(lhs, rhs) {
@@ -751,7 +765,11 @@ pub fn try_type_union_resolution_with_struct(
             let keys = fields.iter().map(|f| f.name().to_owned()).join(",");
             if let Some(ref k) = keys_string {
                 if *k != keys {
-                    return exec_err!("Expect same keys for struct type but got mismatched pair {} and {}", *k, keys);
+                    return exec_err!(
+                        "Expect same keys for struct type but got mismatched pair {} and {}",
+                        *k,
+                        keys
+                    );
                 }
             } else {
                 keys_string = Some(keys);
@@ -765,7 +783,9 @@ pub fn try_type_union_resolution_with_struct(
     {
         fields.iter().map(|f| f.data_type().to_owned()).collect()
     } else {
-        return internal_err!("Struct type is checked is the previous function, so this should be unreachable");
+        return internal_err!(
+            "Struct type is checked is the previous function, so this should be unreachable"
+        );
     };
 
     for data_type in data_types.iter().skip(1) {
@@ -838,6 +858,7 @@ pub fn comparison_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<D
     }
     binary_numeric_coercion(lhs_type, rhs_type)
         .or_else(|| dictionary_comparison_coercion(lhs_type, rhs_type, true))
+        .or_else(|| ree_comparison_coercion(lhs_type, rhs_type, true))
         .or_else(|| temporal_coercion_nonstrict_timezone(lhs_type, rhs_type))
         .or_else(|| string_coercion(lhs_type, rhs_type))
         .or_else(|| list_coercion(lhs_type, rhs_type))
@@ -867,6 +888,7 @@ pub fn comparison_coercion_numeric(
     }
     binary_numeric_coercion(lhs_type, rhs_type)
         .or_else(|| dictionary_comparison_coercion_numeric(lhs_type, rhs_type, true))
+        .or_else(|| ree_comparison_coercion_numeric(lhs_type, rhs_type, true))
         .or_else(|| string_coercion(lhs_type, rhs_type))
         .or_else(|| null_coercion(lhs_type, rhs_type))
         .or_else(|| string_numeric_coercion_as_numeric(lhs_type, rhs_type))
@@ -931,13 +953,13 @@ fn string_temporal_coercion(
                 match temporal {
                     Date32 | Date64 => Some(temporal.clone()),
                     Time32(_) | Time64(_) => {
-                        if is_time_with_valid_unit(temporal.to_owned()) {
+                        if is_time_with_valid_unit(temporal) {
                             Some(temporal.to_owned())
                         } else {
                             None
                         }
                     }
-                    Timestamp(_, tz) => Some(Timestamp(TimeUnit::Nanosecond, tz.clone())),
+                    Timestamp(_, tz) => Some(Timestamp(Nanosecond, tz.clone())),
                     _ => None,
                 }
             }
@@ -1423,6 +1445,73 @@ fn dictionary_comparison_coercion_numeric(
     )
 }
 
+/// Coercion rules for RunEndEncoded: the type that both lhs and rhs
+/// can be casted to for the purpose of a computation.
+///
+/// Not all operators support REE, if `preserve_ree` is true
+/// REE will be preserved if possible
+///
+/// The `coerce_fn` parameter determines which comparison coercion function to use
+/// for comparing the REE value types.
+fn ree_comparison_coercion_generic(
+    lhs_type: &DataType,
+    rhs_type: &DataType,
+    preserve_ree: bool,
+    coerce_fn: fn(&DataType, &DataType) -> Option<DataType>,
+) -> Option<DataType> {
+    use arrow::datatypes::DataType::*;
+    match (lhs_type, rhs_type) {
+        (RunEndEncoded(_, lhs_values_field), RunEndEncoded(_, rhs_values_field)) => {
+            coerce_fn(lhs_values_field.data_type(), rhs_values_field.data_type())
+        }
+        (ree @ RunEndEncoded(_, values_field), other_type)
+        | (other_type, ree @ RunEndEncoded(_, values_field))
+            if preserve_ree && values_field.data_type() == other_type =>
+        {
+            Some(ree.clone())
+        }
+        (RunEndEncoded(_, values_field), _) => {
+            coerce_fn(values_field.data_type(), rhs_type)
+        }
+        (_, RunEndEncoded(_, values_field)) => {
+            coerce_fn(lhs_type, values_field.data_type())
+        }
+        _ => None,
+    }
+}
+
+/// Coercion rules for RunEndEncoded: the type that both lhs and rhs
+/// can be casted to for the purpose of a computation.
+///
+/// Not all operators support REE, if `preserve_ree` is true
+/// REE will be preserved if possible
+fn ree_comparison_coercion(
+    lhs_type: &DataType,
+    rhs_type: &DataType,
+    preserve_ree: bool,
+) -> Option<DataType> {
+    ree_comparison_coercion_generic(lhs_type, rhs_type, preserve_ree, comparison_coercion)
+}
+
+/// Coercion rules for RunEndEncoded with numeric preference: similar to
+/// [`ree_comparison_coercion`] but uses [`comparison_coercion_numeric`]
+/// which prefers numeric types over strings when both are present.
+///
+/// This is used by [`comparison_coercion_numeric`] to maintain consistent
+/// numeric-preferring semantics when dealing with REE types.
+fn ree_comparison_coercion_numeric(
+    lhs_type: &DataType,
+    rhs_type: &DataType,
+    preserve_ree: bool,
+) -> Option<DataType> {
+    ree_comparison_coercion_generic(
+        lhs_type,
+        rhs_type,
+        preserve_ree,
+        comparison_coercion_numeric,
+    )
+}
+
 /// Coercion rules for string concat.
 /// This is a union of string coercion rules and specified rules:
 /// 1. At least one side of lhs and rhs should be string type (Utf8 / LargeUtf8)
@@ -1601,12 +1690,13 @@ fn binary_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType>
 }
 
 /// Coercion rules for like operations.
-/// This is a union of string coercion rules and dictionary coercion rules
+/// This is a union of string coercion rules, dictionary coercion rules, and REE coercion rules
 pub fn like_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     string_coercion(lhs_type, rhs_type)
         .or_else(|| list_coercion(lhs_type, rhs_type))
         .or_else(|| binary_to_string_coercion(lhs_type, rhs_type))
         .or_else(|| dictionary_comparison_coercion(lhs_type, rhs_type, false))
+        .or_else(|| ree_comparison_coercion(lhs_type, rhs_type, false))
         .or_else(|| regex_null_coercion(lhs_type, rhs_type))
         .or_else(|| null_coercion(lhs_type, rhs_type))
 }
@@ -1633,13 +1723,13 @@ pub fn regex_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataTy
 /// Checks if the TimeUnit associated with a Time32 or Time64 type is consistent,
 /// as Time32 can only be used to Second and Millisecond accuracy, while Time64
 /// is exclusively used to Microsecond and Nanosecond accuracy
-fn is_time_with_valid_unit(datatype: DataType) -> bool {
+fn is_time_with_valid_unit(datatype: &DataType) -> bool {
     matches!(
         datatype,
-        DataType::Time32(TimeUnit::Second)
-            | DataType::Time32(TimeUnit::Millisecond)
-            | DataType::Time64(TimeUnit::Microsecond)
-            | DataType::Time64(TimeUnit::Nanosecond)
+        &DataType::Time32(Second)
+            | &DataType::Time32(Millisecond)
+            | &DataType::Time64(Microsecond)
+            | &DataType::Time64(Nanosecond)
     )
 }
 
@@ -1725,6 +1815,73 @@ fn temporal_coercion_strict_timezone(
     }
 }
 
+fn temporal_math_coercion(
+    lhs_type: &DataType,
+    rhs_type: &DataType,
+) -> Option<(DataType, DataType)> {
+    use DataType::*;
+
+    match (lhs_type, rhs_type) {
+        // Coerce Date + int -> Date + Interval
+        (Date32, Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64) => {
+            Some((Date32, Interval(MonthDayNano)))
+        }
+        (Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64, Date32) => {
+            Some((Interval(MonthDayNano), Date32))
+        }
+        (Date64, Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64) => {
+            Some((Date64, Interval(MonthDayNano)))
+        }
+        (Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64, Date64) => {
+            Some((Interval(MonthDayNano), Date64))
+        }
+        // Coerce Date + time -> timestamp + Duration
+        (Date32, Time32(_)) => Some((Timestamp(Nanosecond, None), Duration(Nanosecond))),
+        (Time32(_), Date32) => Some((Duration(Nanosecond), Timestamp(Nanosecond, None))),
+
+        (Date32, Time64(_)) => Some((Timestamp(Nanosecond, None), Duration(Nanosecond))),
+        (Time64(_), Date32) => Some((Duration(Nanosecond), Timestamp(Nanosecond, None))),
+
+        (Date64, Time32(_)) => Some((Timestamp(Nanosecond, None), Duration(Nanosecond))),
+        (Time32(_), Date64) => Some((Duration(Nanosecond), Timestamp(Nanosecond, None))),
+
+        (Date64, Time64(_)) => Some((Timestamp(Nanosecond, None), Duration(Nanosecond))),
+        (Time64(_), Date64) => Some((Duration(Nanosecond), Timestamp(Nanosecond, None))),
+
+        // Coerce Duration to match Timestamp's unit,
+        // e.g. Timestamp(ms) + Duration(s) → Timestamp(ms) + Duration(ms)
+        (Timestamp(ts_unit, tz), Duration(_)) => {
+            Some((Timestamp(*ts_unit, tz.clone()), Duration(*ts_unit)))
+        }
+        (Duration(_), Timestamp(ts_unit, tz)) => {
+            Some((Duration(*ts_unit), Timestamp(*ts_unit, tz.clone())))
+        }
+        // time - time -> Interval
+        (Time32(_) | Time64(_), Time32(_) | Time64(_)) => {
+            Some((Interval(MonthDayNano), Interval(MonthDayNano)))
+        }
+        // time + interval -> Interval
+        (Time32(_) | Time64(_), Interval(_)) => {
+            Some((Interval(MonthDayNano), Interval(MonthDayNano)))
+        }
+        (Interval(_), Time32(_) | Time64(_)) => {
+            Some((Interval(MonthDayNano), Interval(MonthDayNano)))
+        }
+        // Interval * number => Interval
+        (
+            Interval(_),
+            Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | Float16
+            | Float32 | Float64,
+        ) => Some((Interval(MonthDayNano), Interval(MonthDayNano))),
+        (
+            Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | Float16
+            | Float32 | Float64,
+            Interval(_),
+        ) => Some((Interval(MonthDayNano), Interval(MonthDayNano))),
+        _ => None,
+    }
+}
+
 fn temporal_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     use arrow::datatypes::DataType::*;
     use arrow::datatypes::IntervalUnit::*;
@@ -1734,7 +1891,19 @@ fn temporal_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataTyp
         (Interval(_) | Duration(_), Interval(_) | Duration(_)) => {
             Some(Interval(MonthDayNano))
         }
+        (Date32, Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64)
+        | (Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64, Date32) => {
+            Some(Date32)
+        }
+        (Date64, Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64)
+        | (Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64, Date64) => {
+            Some(Date64)
+        }
         (Date64, Date32) | (Date32, Date64) => Some(Date64),
+        (Date32, Time32(_)) | (Time32(_), Date32) => Some(Timestamp(Nanosecond, None)),
+        (Date32, Time64(_)) | (Time64(_), Date32) => Some(Timestamp(Nanosecond, None)),
+        (Date64, Time32(_)) | (Time32(_), Date64) => Some(Timestamp(Nanosecond, None)),
+        (Date64, Time64(_)) | (Time64(_), Date64) => Some(Timestamp(Nanosecond, None)),
         (Timestamp(_, None), Date64) | (Date64, Timestamp(_, None)) => {
             Some(Timestamp(Nanosecond, None))
         }

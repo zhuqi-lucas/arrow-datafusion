@@ -24,7 +24,7 @@ use super::expressions::{Column, Literal};
 use super::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use super::{
     DisplayAs, ExecutionPlanProperties, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream, Statistics,
+    SendableRecordBatchStream, SortOrderPushdownResult, Statistics,
 };
 use crate::execution_plan::CardinalityEffect;
 use crate::filter_pushdown::{
@@ -40,21 +40,24 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow::datatypes::SchemaRef;
-use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use arrow::record_batch::RecordBatch;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
-use datafusion_common::{internal_err, JoinSide, Result};
+use datafusion_common::{JoinSide, Result, internal_err};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
+use datafusion_physical_expr::projection::Projector;
 use datafusion_physical_expr::utils::collect_columns;
-use datafusion_physical_expr_common::physical_expr::{fmt_sql, PhysicalExprRef};
-use datafusion_physical_expr_common::sort_expr::{LexOrdering, LexRequirement};
+use datafusion_physical_expr_common::physical_expr::{PhysicalExprRef, fmt_sql};
+use datafusion_physical_expr_common::sort_expr::{
+    LexOrdering, LexRequirement, PhysicalSortExpr,
+};
 // Re-exported from datafusion-physical-expr for backwards compatibility
 // We recommend updating your imports to use datafusion-physical-expr directly
 pub use datafusion_physical_expr::projection::{
-    update_expr, ProjectionExpr, ProjectionExprs,
+    ProjectionExpr, ProjectionExprs, update_expr,
 };
 
 use futures::stream::{Stream, StreamExt};
@@ -66,10 +69,9 @@ use log::trace;
 /// output row for each input row.
 #[derive(Debug, Clone)]
 pub struct ProjectionExec {
-    /// The projection expressions stored as tuples of (expression, output column name)
-    projection: ProjectionExprs,
-    /// The schema once the projection has been applied to the input
-    schema: SchemaRef,
+    /// A projector specialized to apply the projection to the input schema from the child node
+    /// and produce [`RecordBatch`]es with the output schema of this node.
+    projector: Projector,
     /// The input plan
     input: Arc<dyn ExecutionPlan>,
     /// Execution metrics
@@ -137,16 +139,17 @@ impl ProjectionExec {
         // convert argument to Vec<ProjectionExpr>
         let expr_vec = expr.into_iter().map(Into::into).collect::<Vec<_>>();
         let projection = ProjectionExprs::new(expr_vec);
-
-        let schema = Arc::new(projection.project_schema(&input_schema)?);
+        let projector = projection.make_projector(&input_schema)?;
 
         // Construct a map from the input expressions to the output expression of the Projection
         let projection_mapping = projection.projection_mapping(&input_schema)?;
-        let cache =
-            Self::compute_properties(&input, &projection_mapping, Arc::clone(&schema))?;
+        let cache = Self::compute_properties(
+            &input,
+            &projection_mapping,
+            Arc::clone(projector.output_schema()),
+        )?;
         Ok(Self {
-            projection,
-            schema,
+            projector,
             input,
             metrics: ExecutionPlanMetricsSet::new(),
             cache,
@@ -155,7 +158,12 @@ impl ProjectionExec {
 
     /// The projection expressions stored as tuples of (expression, output column name)
     pub fn expr(&self) -> &[ProjectionExpr] {
-        self.projection.as_ref()
+        self.projector.projection().as_ref()
+    }
+
+    /// The projection expressions as a [`ProjectionExprs`].
+    pub fn projection_expr(&self) -> &ProjectionExprs {
+        self.projector.projection()
     }
 
     /// The input plan
@@ -195,7 +203,8 @@ impl DisplayAs for ProjectionExec {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 let expr: Vec<String> = self
-                    .projection
+                    .projector
+                    .projection()
                     .as_ref()
                     .iter()
                     .map(|proj_expr| {
@@ -246,10 +255,15 @@ impl ExecutionPlan for ProjectionExec {
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        let all_simple_exprs = self.projection.iter().all(|proj_expr| {
-            proj_expr.expr.as_any().is::<Column>()
-                || proj_expr.expr.as_any().is::<Literal>()
-        });
+        let all_simple_exprs =
+            self.projector
+                .projection()
+                .as_ref()
+                .iter()
+                .all(|proj_expr| {
+                    proj_expr.expr.as_any().is::<Column>()
+                        || proj_expr.expr.as_any().is::<Literal>()
+                });
         // If expressions are all either column_expr or Literal, then all computations in this projection are reorder or rename,
         // and projection would not benefit from the repartition, benefits_from_input_partitioning will return false.
         vec![!all_simple_exprs]
@@ -263,8 +277,11 @@ impl ExecutionPlan for ProjectionExec {
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        ProjectionExec::try_new(self.projection.clone(), children.swap_remove(0))
-            .map(|p| Arc::new(p) as _)
+        ProjectionExec::try_new(
+            self.projector.projection().clone(),
+            children.swap_remove(0),
+        )
+        .map(|p| Arc::new(p) as _)
     }
 
     fn execute(
@@ -272,13 +289,19 @@ impl ExecutionPlan for ProjectionExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        trace!("Start ProjectionExec::execute for partition {} of context session_id {} and task_id {:?}", partition, context.session_id(), context.task_id());
+        trace!(
+            "Start ProjectionExec::execute for partition {} of context session_id {} and task_id {:?}",
+            partition,
+            context.session_id(),
+            context.task_id()
+        );
+
+        let projector = self.projector.with_metrics(&self.metrics, partition);
         Ok(Box::pin(ProjectionStream::new(
-            Arc::clone(&self.schema),
-            self.projection.expr_iter().collect(),
+            projector,
             self.input.execute(partition, context)?,
             BaselineMetrics::new(&self.metrics, partition),
-        )))
+        )?))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -291,8 +314,10 @@ impl ExecutionPlan for ProjectionExec {
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
         let input_stats = self.input.partition_statistics(partition)?;
-        self.projection
-            .project_statistics(input_stats, &self.input.schema())
+        let output_schema = self.schema();
+        self.projector
+            .projection()
+            .project_statistics(input_stats, &output_schema)
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -347,6 +372,72 @@ impl ExecutionPlan for ProjectionExec {
         Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
     }
 
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        let child = self.input();
+        let mut child_order = Vec::new();
+
+        // Check and transform sort expressions
+        for sort_expr in order {
+            // Recursively transform the expression
+            let mut can_pushdown = true;
+            let transformed = Arc::clone(&sort_expr.expr).transform(|expr| {
+                if let Some(col) = expr.as_any().downcast_ref::<Column>() {
+                    // Check if column index is valid.
+                    // This should always be true but fail gracefully if it's not.
+                    if col.index() >= self.expr().len() {
+                        can_pushdown = false;
+                        return Ok(Transformed::no(expr));
+                    }
+
+                    let proj_expr = &self.expr()[col.index()];
+
+                    // Check if projection expression is a simple column
+                    // We cannot push down order by clauses that depend on
+                    // projected computations as they would have nothing to reference.
+                    if let Some(child_col) =
+                        proj_expr.expr.as_any().downcast_ref::<Column>()
+                    {
+                        // Replace with the child column
+                        Ok(Transformed::yes(Arc::new(child_col.clone()) as _))
+                    } else {
+                        // Projection involves computation, cannot push down
+                        can_pushdown = false;
+                        Ok(Transformed::no(expr))
+                    }
+                } else {
+                    Ok(Transformed::no(expr))
+                }
+            })?;
+
+            if !can_pushdown {
+                return Ok(SortOrderPushdownResult::Unsupported);
+            }
+
+            child_order.push(PhysicalSortExpr {
+                expr: transformed.data,
+                options: sort_expr.options,
+            });
+        }
+
+        // Recursively push down to child node
+        match child.try_pushdown_sort(&child_order)? {
+            SortOrderPushdownResult::Exact { inner } => {
+                let new_exec = Arc::new(self.clone()).with_new_children(vec![inner])?;
+                Ok(SortOrderPushdownResult::Exact { inner: new_exec })
+            }
+            SortOrderPushdownResult::Inexact { inner } => {
+                let new_exec = Arc::new(self.clone()).with_new_children(vec![inner])?;
+                Ok(SortOrderPushdownResult::Inexact { inner: new_exec })
+            }
+            SortOrderPushdownResult::Unsupported => {
+                Ok(SortOrderPushdownResult::Unsupported)
+            }
+        }
+    }
+
     fn with_preserve_order(
         &self,
         preserve_order: bool,
@@ -364,46 +455,27 @@ impl ExecutionPlan for ProjectionExec {
 impl ProjectionStream {
     /// Create a new projection stream
     fn new(
-        schema: SchemaRef,
-        expr: Vec<Arc<dyn PhysicalExpr>>,
+        projector: Projector,
         input: SendableRecordBatchStream,
         baseline_metrics: BaselineMetrics,
-    ) -> Self {
-        Self {
-            schema,
-            expr,
+    ) -> Result<Self> {
+        Ok(Self {
+            projector,
             input,
             baseline_metrics,
-        }
+        })
     }
 
     fn batch_project(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         // Records time on drop
         let _timer = self.baseline_metrics.elapsed_compute().timer();
-        let arrays = self
-            .expr
-            .iter()
-            .map(|expr| {
-                expr.evaluate(batch)
-                    .and_then(|v| v.into_array(batch.num_rows()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        if arrays.is_empty() {
-            let options =
-                RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-            RecordBatch::try_new_with_options(Arc::clone(&self.schema), arrays, &options)
-                .map_err(Into::into)
-        } else {
-            RecordBatch::try_new(Arc::clone(&self.schema), arrays).map_err(Into::into)
-        }
+        self.projector.project_batch(batch)
     }
 }
 
 /// Projection iterator
 struct ProjectionStream {
-    schema: SchemaRef,
-    expr: Vec<Arc<dyn PhysicalExpr>>,
+    projector: Projector,
     input: SendableRecordBatchStream,
     baseline_metrics: BaselineMetrics,
 }
@@ -432,7 +504,7 @@ impl Stream for ProjectionStream {
 impl RecordBatchStream for ProjectionStream {
     /// Get the schema
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        Arc::clone(self.projector.output_schema())
     }
 }
 
@@ -512,7 +584,7 @@ pub fn try_pushdown_through_join(
     join_left: &Arc<dyn ExecutionPlan>,
     join_right: &Arc<dyn ExecutionPlan>,
     join_on: JoinOnRef,
-    schema: SchemaRef,
+    schema: &SchemaRef,
     filter: Option<&JoinFilter>,
 ) -> Result<Option<JoinData>> {
     // Convert projected expressions to columns. We can not proceed if this is not possible.
@@ -525,7 +597,7 @@ pub fn try_pushdown_through_join(
 
     if !join_allows_pushdown(
         &projection_as_columns,
-        &schema,
+        schema,
         far_right_left_col_ind,
         far_left_right_col_ind,
     ) {
@@ -812,10 +884,6 @@ pub fn update_join_on(
     hash_join_on: &[(PhysicalExprRef, PhysicalExprRef)],
     left_field_size: usize,
 ) -> Option<Vec<(PhysicalExprRef, PhysicalExprRef)>> {
-    // TODO: Clippy wants the "map" call removed, but doing so generates
-    //       a compilation error. Remove the clippy directive once this
-    //       issue is fixed.
-    #[allow(clippy::map_identity)]
     let (left_idx, right_idx): (Vec<_>, Vec<_>) = hash_join_on
         .iter()
         .map(|(left, right)| (left, right))
@@ -1027,15 +1095,16 @@ mod tests {
     use std::sync::Arc;
 
     use crate::common::collect;
+
     use crate::test;
     use crate::test::exec::StatisticsExec;
 
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::stats::{ColumnStatistics, Precision, Statistics};
     use datafusion_common::ScalarValue;
+    use datafusion_common::stats::{ColumnStatistics, Precision, Statistics};
 
     use datafusion_expr::Operator;
-    use datafusion_physical_expr::expressions::{col, BinaryExpr, Column, Literal};
+    use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal, col};
 
     #[test]
     fn test_collect_column_indices() -> Result<()> {

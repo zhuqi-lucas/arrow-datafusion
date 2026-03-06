@@ -22,25 +22,25 @@ use datafusion::common::NullEquality;
 use datafusion::functions_aggregate::sum;
 use datafusion::physical_expr::aggregate::AggregateExprBuilder;
 use datafusion::physical_plan;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{
     AggregateExec, AggregateMode, PhysicalGroupBy,
 };
 use datafusion::physical_plan::execution_plan::Boundedness;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
-use datafusion_common::{exec_datafusion_err, DataFusionError, JoinType, ScalarValue};
+use datafusion_common::{DataFusionError, JoinType, ScalarValue, exec_datafusion_err};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr_common::operator::Operator;
 use datafusion_expr_common::operator::Operator::{Divide, Eq, Gt, Modulo};
 use datafusion_functions_aggregate::min_max;
-use datafusion_physical_expr::expressions::{
-    binary, col, lit, BinaryExpr, Column, Literal,
-};
 use datafusion_physical_expr::Partitioning;
+use datafusion_physical_expr::expressions::{
+    BinaryExpr, Column, Literal, binary, col, lit,
+};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
-use datafusion_physical_optimizer::ensure_coop::EnsureCooperative;
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
+use datafusion_physical_optimizer::ensure_coop::EnsureCooperative;
 use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion_physical_plan::coop::make_cooperative;
 use datafusion_physical_plan::filter::FilterExec;
@@ -64,13 +64,14 @@ use std::time::Duration;
 use tokio::runtime::{Handle, Runtime};
 use tokio::select;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RangeBatchGenerator {
     schema: SchemaRef,
     value_range: Range<i64>,
     boundedness: Boundedness,
     batch_size: usize,
     poll_count: usize,
+    original_range: Range<i64>,
 }
 
 impl std::fmt::Display for RangeBatchGenerator {
@@ -110,6 +111,13 @@ impl LazyBatchGenerator for RangeBatchGenerator {
             RecordBatch::try_new(Arc::clone(&self.schema), vec![Arc::new(array)])?;
         Ok(Some(batch))
     }
+
+    fn reset_state(&self) -> Arc<RwLock<dyn LazyBatchGenerator>> {
+        let mut new = self.clone();
+        new.poll_count = 0;
+        new.value_range = new.original_range.clone();
+        Arc::new(RwLock::new(new))
+    }
 }
 
 fn make_lazy_exec(column_name: &str, pretend_infinite: bool) -> LazyMemoryExec {
@@ -136,16 +144,17 @@ fn make_lazy_exec_with_range(
     };
 
     // Instantiate the generator with the batch and limit
-    let gen = RangeBatchGenerator {
+    let batch_gen = RangeBatchGenerator {
         schema: Arc::clone(&schema),
         boundedness,
-        value_range: range,
+        value_range: range.clone(),
         batch_size: 8192,
         poll_count: 0,
+        original_range: range,
     };
 
     // Wrap the generator in a trait object behind Arc<RwLock<_>>
-    let generator: Arc<RwLock<dyn LazyBatchGenerator>> = Arc::new(RwLock::new(gen));
+    let generator: Arc<RwLock<dyn LazyBatchGenerator>> = Arc::new(RwLock::new(batch_gen));
 
     // Create a LazyMemoryExec with one partition using our generator
     let mut exec = LazyMemoryExec::try_new(schema, vec![generator]).unwrap();
@@ -170,7 +179,7 @@ async fn agg_no_grouping_yields(
     let inf = Arc::new(make_lazy_exec("value", pretend_infinite));
     let aggr = Arc::new(AggregateExec::try_new(
         AggregateMode::Single,
-        PhysicalGroupBy::new(vec![], vec![], vec![]),
+        PhysicalGroupBy::new(vec![], vec![], vec![], false),
         vec![Arc::new(
             AggregateExprBuilder::new(
                 sum::sum_udaf(),
@@ -204,7 +213,7 @@ async fn agg_grouping_yields(
 
     let aggr = Arc::new(AggregateExec::try_new(
         AggregateMode::Single,
-        PhysicalGroupBy::new(vec![(group, "group".to_string())], vec![], vec![]),
+        PhysicalGroupBy::new(vec![(group, "group".to_string())], vec![], vec![], false),
         vec![Arc::new(
             AggregateExprBuilder::new(sum::sum_udaf(), vec![value_col.clone()])
                 .schema(inf.schema())
@@ -240,6 +249,7 @@ async fn agg_grouped_topk_yields(
                 vec![(group, "group".to_string())],
                 vec![],
                 vec![vec![false]],
+                false,
             ),
             vec![Arc::new(
                 AggregateExprBuilder::new(min_max::max_udaf(), vec![value_col.clone()])
@@ -545,6 +555,7 @@ async fn interleave_then_aggregate_yields(
             vec![], // no GROUP BY columns
             vec![], // no GROUP BY expressions
             vec![], // no GROUP BY physical expressions
+            false,
         ),
         vec![Arc::new(aggregate_expr)],
         vec![None], // no “distinct” flags
@@ -653,7 +664,7 @@ async fn join_agg_yields(
 
     let proj_expr = vec![ProjectionExpr::new(
         Arc::new(Column::new_with_schema("value", &input_schema)?) as _,
-        "value".to_string(),
+        "value",
     )];
 
     let projection = Arc::new(ProjectionExec::try_new(proj_expr, join)?);
@@ -676,7 +687,7 @@ async fn join_agg_yields(
 
     let aggr = Arc::new(AggregateExec::try_new(
         AggregateMode::Single,
-        PhysicalGroupBy::new(vec![], vec![], vec![]),
+        PhysicalGroupBy::new(vec![], vec![], vec![], false),
         vec![Arc::new(aggregate_expr)],
         vec![None],
         projection,

@@ -21,37 +21,41 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::{any::Any, vec};
 
-use crate::execution_plan::{boundedness_from_children, EmissionType};
+use crate::ExecutionPlanProperties;
+use crate::execution_plan::{EmissionType, boundedness_from_children};
 use crate::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase,
     FilterPushdownPropagation,
 };
-use crate::joins::hash_join::shared_bounds::{ColumnBounds, SharedBoundsAccumulator};
+use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
+use crate::joins::hash_join::shared_bounds::{
+    ColumnBounds, PartitionBounds, PushdownStrategy, SharedBuildAccumulator,
+};
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
 use crate::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64};
 use crate::joins::utils::{
-    asymmetric_join_output_partitioning, reorder_output_after_swap, swap_join_projection,
-    update_hash, OnceAsync, OnceFut,
+    OnceAsync, OnceFut, asymmetric_join_output_partitioning, reorder_output_after_swap,
+    swap_join_projection, update_hash,
 };
 use crate::joins::{JoinOn, JoinOnRef, PartitionMode, SharedBitmapBuilder};
 use crate::projection::{
-    try_embed_projection, try_pushdown_through_join, EmbeddedProjection, JoinData,
-    ProjectionExec,
+    EmbeddedProjection, JoinData, ProjectionExec, try_embed_projection,
+    try_pushdown_through_join,
 };
+use crate::repartition::REPARTITION_RANDOM_STATE;
 use crate::spill::get_record_batch_memory_size;
-use crate::ExecutionPlanProperties;
 use crate::{
-    common::can_project,
-    joins::utils::{
-        build_join_schema, check_join_is_valid, estimate_join_statistics,
-        need_produce_result_in_final, symmetric_join_output_partitioning,
-        BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinHashMapType,
-    },
-    metrics::{ExecutionPlanMetricsSet, MetricsSet},
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
     PlanProperties, SendableRecordBatchStream, Statistics,
+    common::can_project,
+    joins::utils::{
+        BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinHashMapType,
+        build_join_schema, check_join_is_valid, estimate_join_statistics,
+        need_produce_result_in_final, symmetric_join_output_partitioning,
+    },
+    metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
 use arrow::array::{ArrayRef, BooleanBufferBuilder};
@@ -63,31 +67,36 @@ use arrow_schema::DataType;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{
-    internal_err, plan_err, project_schema, JoinSide, JoinType, NullEquality, Result,
+    JoinSide, JoinType, NullEquality, Result, assert_or_internal_err, plan_err,
+    project_schema,
 };
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::TaskContext;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_expr::Accumulator;
 use datafusion_functions_aggregate_common::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_physical_expr::equivalence::{
-    join_equivalence_properties, ProjectionMapping,
+    ProjectionMapping, join_equivalence_properties,
 };
-use datafusion_physical_expr::expressions::{lit, DynamicFilterPhysicalExpr};
+use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 
 use ahash::RandomState;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
+use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::TryStreamExt;
 use parking_lot::Mutex;
 
+use super::partitioned_hash_eval::SeededRandomState;
+
 /// Hard-coded seed to ensure hash values from the hash join differ from `RepartitionExec`, avoiding collisions.
-const HASH_JOIN_SEED: RandomState =
-    RandomState::with_seeds('J' as u64, 'O' as u64, 'I' as u64, 'N' as u64);
+pub(crate) const HASH_JOIN_SEED: SeededRandomState =
+    SeededRandomState::with_seeds('J' as u64, 'O' as u64, 'I' as u64, 'N' as u64);
 
 /// HashTable and input data for the left (build side) of a join
 pub(super) struct JoinLeftData {
     /// The hash table with indices into `batch`
-    pub(super) hash_map: Box<dyn JoinHashMapType>,
+    /// Arc is used to allow sharing with SharedBuildAccumulator for hash map pushdown
+    pub(super) hash_map: Arc<dyn JoinHashMapType>,
     /// The input rows for the build side
     batch: RecordBatch,
     /// The build side on expressions values
@@ -102,32 +111,16 @@ pub(super) struct JoinLeftData {
     /// This could hide potential out-of-memory issues, especially when upstream operators increase their memory consumption.
     /// The MemoryReservation ensures proper tracking of memory resources throughout the join operation's lifecycle.
     _reservation: MemoryReservation,
-    /// Bounds computed from the build side for dynamic filter pushdown
-    pub(super) bounds: Option<Vec<ColumnBounds>>,
+    /// Bounds computed from the build side for dynamic filter pushdown.
+    /// If the partition is empty (no rows) this will be None.
+    /// If the partition has some rows this will be Some with the bounds for each join key column.
+    pub(super) bounds: Option<PartitionBounds>,
+    /// Membership testing strategy for filter pushdown
+    /// Contains either InList values for small build sides or hash table reference for large build sides
+    pub(super) membership: PushdownStrategy,
 }
 
 impl JoinLeftData {
-    /// Create a new `JoinLeftData` from its parts
-    pub(super) fn new(
-        hash_map: Box<dyn JoinHashMapType>,
-        batch: RecordBatch,
-        values: Vec<ArrayRef>,
-        visited_indices_bitmap: SharedBitmapBuilder,
-        probe_threads_counter: AtomicUsize,
-        reservation: MemoryReservation,
-        bounds: Option<Vec<ColumnBounds>>,
-    ) -> Self {
-        Self {
-            hash_map,
-            batch,
-            values,
-            visited_indices_bitmap,
-            probe_threads_counter,
-            _reservation: reservation,
-            bounds,
-        }
-    }
-
     /// return a reference to the hash map
     pub(super) fn hash_map(&self) -> &dyn JoinHashMapType {
         &*self.hash_map
@@ -148,6 +141,11 @@ impl JoinLeftData {
         &self.visited_indices_bitmap
     }
 
+    /// returns a reference to the InList values for filter pushdown
+    pub(super) fn membership(&self) -> &PushdownStrategy {
+        &self.membership
+    }
+
     /// Decrements the counter of running threads, and returns `true`
     /// if caller is the last running thread
     pub(super) fn report_probe_completed(&self) -> bool {
@@ -155,7 +153,7 @@ impl JoinLeftData {
     }
 }
 
-#[allow(rustdoc::private_intra_doc_links)]
+#[expect(rustdoc::private_intra_doc_links)]
 /// Join execution plan: Evaluates equijoin predicates in parallel on multiple
 /// partitions using a hash table and an optional filter list to apply post
 /// join.
@@ -338,8 +336,8 @@ pub struct HashJoinExec {
     /// Each output stream waits on the `OnceAsync` to signal the completion of
     /// the hash table creation.
     left_fut: Arc<OnceAsync<JoinLeftData>>,
-    /// Shared the `RandomState` for the hashing algorithm
-    random_state: RandomState,
+    /// Shared the `SeededRandomState` for the hashing algorithm (seeds preserved for serialization)
+    random_state: SeededRandomState,
     /// Partitioning mode to use
     pub mode: PartitionMode,
     /// Execution metrics
@@ -362,9 +360,9 @@ pub struct HashJoinExec {
 struct HashJoinExecDynamicFilter {
     /// Dynamic filter that we'll update with the results of the build side once that is done.
     filter: Arc<DynamicFilterPhysicalExpr>,
-    /// Bounds accumulator to keep track of the min/max bounds on the join keys for each partition.
+    /// Build accumulator to collect build-side information (hash maps and/or bounds) from each partition.
     /// It is lazily initialized during execution to make sure we use the actual execution time partition counts.
-    bounds_accumulator: OnceLock<Arc<SharedBoundsAccumulator>>,
+    build_accumulator: OnceLock<Arc<SharedBuildAccumulator>>,
 }
 
 impl fmt::Debug for HashJoinExec {
@@ -400,7 +398,7 @@ impl HashJoinExec {
     ///
     /// # Error
     /// This function errors when it is not possible to join the left and right sides on keys `on`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn try_new(
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,
@@ -432,7 +430,7 @@ impl HashJoinExec {
         let cache = Self::compute_properties(
             &left,
             &right,
-            Arc::clone(&join_schema),
+            &join_schema,
             *join_type,
             &on,
             partition_mode,
@@ -510,6 +508,17 @@ impl HashJoinExec {
         self.null_equality
     }
 
+    /// Get the dynamic filter expression for testing purposes.
+    /// Returns `None` if no dynamic filter has been set.
+    ///
+    /// This method is intended for testing only and should not be used in production code.
+    #[doc(hidden)]
+    pub fn dynamic_filter_for_test(&self) -> Option<Arc<DynamicFilterPhysicalExpr>> {
+        self.dynamic_filter
+            .as_ref()
+            .map(|df| Arc::clone(&df.filter))
+    }
+
     /// Calculate order preservation flags for this hash join.
     fn maintains_input_order(join_type: JoinType) -> Vec<bool> {
         vec![
@@ -563,7 +572,7 @@ impl HashJoinExec {
     fn compute_properties(
         left: &Arc<dyn ExecutionPlan>,
         right: &Arc<dyn ExecutionPlan>,
-        schema: SchemaRef,
+        schema: &SchemaRef,
         join_type: JoinType,
         on: JoinOnRef,
         mode: PartitionMode,
@@ -574,7 +583,7 @@ impl HashJoinExec {
             left.equivalence_properties().clone(),
             right.equivalence_properties().clone(),
             &join_type,
-            Arc::clone(&schema),
+            Arc::clone(schema),
             &Self::maintains_input_order(join_type),
             Some(Self::probe_side()),
             on,
@@ -618,9 +627,8 @@ impl HashJoinExec {
         // If contains projection, update the PlanProperties.
         if let Some(projection) = projection {
             // construct a map from the input expressions to the output expression of the Projection
-            let projection_mapping =
-                ProjectionMapping::from_indices(projection, &schema)?;
-            let out_schema = project_schema(&schema, Some(projection))?;
+            let projection_mapping = ProjectionMapping::from_indices(projection, schema)?;
+            let out_schema = project_schema(schema, Some(projection))?;
             output_partitioning =
                 output_partitioning.project(&projection_mapping, &eq_properties);
             eq_properties = eq_properties.project(&projection_mapping, out_schema);
@@ -865,7 +873,7 @@ impl ExecutionPlan for HashJoinExec {
             cache: Self::compute_properties(
                 &children[0],
                 &children[1],
-                Arc::clone(&self.join_schema),
+                &self.join_schema,
                 self.join_type,
                 &self.on,
                 self.mode,
@@ -911,22 +919,34 @@ impl ExecutionPlan for HashJoinExec {
         let left_partitions = self.left.output_partitioning().partition_count();
         let right_partitions = self.right.output_partitioning().partition_count();
 
-        if self.mode == PartitionMode::Partitioned && left_partitions != right_partitions
-        {
-            return internal_err!(
-                "Invalid HashJoinExec, partition count mismatch {left_partitions}!={right_partitions},\
-                 consider using RepartitionExec"
-            );
-        }
+        assert_or_internal_err!(
+            self.mode != PartitionMode::Partitioned
+                || left_partitions == right_partitions,
+            "Invalid HashJoinExec, partition count mismatch {left_partitions}!={right_partitions},\
+             consider using RepartitionExec"
+        );
 
-        if self.mode == PartitionMode::CollectLeft && left_partitions != 1 {
-            return internal_err!(
-                "Invalid HashJoinExec, the output partition count of the left child must be 1 in CollectLeft mode,\
-                 consider using CoalescePartitionsExec or the EnforceDistribution rule"
-            );
-        }
+        assert_or_internal_err!(
+            self.mode != PartitionMode::CollectLeft || left_partitions == 1,
+            "Invalid HashJoinExec, the output partition count of the left child must be 1 in CollectLeft mode,\
+             consider using CoalescePartitionsExec or the EnforceDistribution rule"
+        );
 
-        let enable_dynamic_filter_pushdown = self.dynamic_filter.is_some();
+        // Only enable dynamic filter pushdown if:
+        // - The session config enables dynamic filter pushdown
+        // - A dynamic filter exists
+        // - At least one consumer is holding a reference to it, this avoids expensive filter
+        //   computation when disabled or when no consumer will use it.
+        let enable_dynamic_filter_pushdown = context
+            .session_config()
+            .options()
+            .optimizer
+            .enable_join_dynamic_filter_pushdown
+            && self
+                .dynamic_filter
+                .as_ref()
+                .map(|df| df.filter.is_used())
+                .unwrap_or(false);
 
         let join_metrics = BuildProbeJoinMetrics::new(partition, &self.metrics);
         let left_fut = match self.mode {
@@ -937,7 +957,7 @@ impl ExecutionPlan for HashJoinExec {
                     MemoryConsumer::new("HashJoinInput").register(context.memory_pool());
 
                 Ok(collect_left_input(
-                    self.random_state.clone(),
+                    self.random_state.random_state().clone(),
                     left_stream,
                     on_left.clone(),
                     join_metrics.clone(),
@@ -945,6 +965,16 @@ impl ExecutionPlan for HashJoinExec {
                     need_produce_result_in_final(self.join_type),
                     self.right().output_partitioning().partition_count(),
                     enable_dynamic_filter_pushdown,
+                    context
+                        .session_config()
+                        .options()
+                        .optimizer
+                        .hash_join_inlist_pushdown_max_size,
+                    context
+                        .session_config()
+                        .options()
+                        .optimizer
+                        .hash_join_inlist_pushdown_max_distinct_values,
                 ))
             })?,
             PartitionMode::Partitioned => {
@@ -955,7 +985,7 @@ impl ExecutionPlan for HashJoinExec {
                         .register(context.memory_pool());
 
                 OnceFut::new(collect_left_input(
-                    self.random_state.clone(),
+                    self.random_state.random_state().clone(),
                     left_stream,
                     on_left.clone(),
                     join_metrics.clone(),
@@ -963,6 +993,16 @@ impl ExecutionPlan for HashJoinExec {
                     need_produce_result_in_final(self.join_type),
                     1,
                     enable_dynamic_filter_pushdown,
+                    context
+                        .session_config()
+                        .options()
+                        .optimizer
+                        .hash_join_inlist_pushdown_max_size,
+                    context
+                        .session_config()
+                        .options()
+                        .optimizer
+                        .hash_join_inlist_pushdown_max_distinct_values,
                 ))
             }
             PartitionMode::Auto => {
@@ -975,8 +1015,10 @@ impl ExecutionPlan for HashJoinExec {
 
         let batch_size = context.session_config().batch_size();
 
-        // Initialize bounds_accumulator lazily with runtime partition counts (only if enabled)
-        let bounds_accumulator = enable_dynamic_filter_pushdown
+        // Initialize build_accumulator lazily with runtime partition counts (only if enabled)
+        // Use RepartitionExec's random state (seeds: 0,0,0,0) for partition routing
+        let repartition_random_state = REPARTITION_RANDOM_STATE;
+        let build_accumulator = enable_dynamic_filter_pushdown
             .then(|| {
                 self.dynamic_filter.as_ref().map(|df| {
                     let filter = Arc::clone(&df.filter);
@@ -985,13 +1027,14 @@ impl ExecutionPlan for HashJoinExec {
                         .iter()
                         .map(|(_, right_expr)| Arc::clone(right_expr))
                         .collect::<Vec<_>>();
-                    Some(Arc::clone(df.bounds_accumulator.get_or_init(|| {
-                        Arc::new(SharedBoundsAccumulator::new_from_partition_mode(
+                    Some(Arc::clone(df.build_accumulator.get_or_init(|| {
+                        Arc::new(SharedBuildAccumulator::new_from_partition_mode(
                             self.mode,
                             self.left.as_ref(),
                             self.right.as_ref(),
                             filter,
                             on_right,
+                            repartition_random_state,
                         ))
                     })))
                 })
@@ -1025,7 +1068,7 @@ impl ExecutionPlan for HashJoinExec {
             self.filter.clone(),
             self.join_type,
             right_stream,
-            self.random_state.clone(),
+            self.random_state.random_state().clone(),
             join_metrics,
             column_indices_after_projection,
             self.null_equality,
@@ -1034,7 +1077,7 @@ impl ExecutionPlan for HashJoinExec {
             batch_size,
             vec![],
             self.right.output_ordering().is_some(),
-            bounds_accumulator,
+            build_accumulator,
             self.mode,
         )))
     }
@@ -1057,7 +1100,7 @@ impl ExecutionPlan for HashJoinExec {
         let stats = estimate_join_statistics(
             self.left.partition_statistics(None)?,
             self.right.partition_statistics(None)?,
-            self.on.clone(),
+            &self.on,
             &self.join_type,
             &self.join_schema,
         )?;
@@ -1096,6 +1139,7 @@ impl ExecutionPlan for HashJoinExec {
             return Ok(None);
         }
 
+        let schema = self.schema();
         if let Some(JoinData {
             projected_left_child,
             projected_right_child,
@@ -1106,7 +1150,7 @@ impl ExecutionPlan for HashJoinExec {
             self.left(),
             self.right(),
             self.on(),
-            self.schema(),
+            &schema,
             self.filter(),
         )? {
             Ok(Some(Arc::new(HashJoinExec::try_new(
@@ -1188,7 +1232,7 @@ impl ExecutionPlan for HashJoinExec {
         let mut result = FilterPushdownPropagation::if_any(child_pushdown_result.clone());
         assert_eq!(child_pushdown_result.self_filters.len(), 2); // Should always be 2, we have 2 children
         let right_child_self_filters = &child_pushdown_result.self_filters[1]; // We only push down filters to the right child
-                                                                               // We expect 0 or 1 self filters
+        // We expect 0 or 1 self filters
         if let Some(filter) = right_child_self_filters.first() {
             // Note that we don't check PushdDownPredicate::discrimnant because even if nothing said
             // "yes, I can fully evaluate this filter" things might still use it for statistics -> it's worth updating
@@ -1214,7 +1258,7 @@ impl ExecutionPlan for HashJoinExec {
                     cache: self.cache.clone(),
                     dynamic_filter: Some(HashJoinExecDynamicFilter {
                         filter: dynamic_filter,
-                        bounds_accumulator: OnceLock::new(),
+                        build_accumulator: OnceLock::new(),
                     }),
                 });
                 result = result.with_updated_node(new_node as Arc<dyn ExecutionPlan>);
@@ -1320,20 +1364,18 @@ impl BuildSideState {
         reservation: MemoryReservation,
         on_left: Vec<Arc<dyn PhysicalExpr>>,
         schema: &SchemaRef,
-        should_compute_bounds: bool,
+        should_compute_dynamic_filters: bool,
     ) -> Result<Self> {
         Ok(Self {
             batches: Vec::new(),
             num_rows: 0,
             metrics,
             reservation,
-            bounds_accumulators: should_compute_bounds
+            bounds_accumulators: should_compute_dynamic_filters
                 .then(|| {
                     on_left
-                        .iter()
-                        .map(|expr| {
-                            CollectLeftAccumulator::try_new(Arc::clone(expr), schema)
-                        })
+                        .into_iter()
+                        .map(|expr| CollectLeftAccumulator::try_new(expr, schema))
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()?,
@@ -1357,19 +1399,19 @@ impl BuildSideState {
 /// * `reservation` - Memory reservation tracker for the hash table and data
 /// * `with_visited_indices_bitmap` - Whether to track visited indices (for outer joins)
 /// * `probe_threads_count` - Number of threads that will probe this hash table
-/// * `should_compute_bounds` - Whether to compute min/max bounds for dynamic filtering
+/// * `should_compute_dynamic_filters` - Whether to compute min/max bounds for dynamic filtering
 ///
 /// # Dynamic Filter Coordination
-/// When `should_compute_bounds` is true, this function computes the min/max bounds
+/// When `should_compute_dynamic_filters` is true, this function computes the min/max bounds
 /// for each join key column but does NOT update the dynamic filter. Instead, the
 /// bounds are stored in the returned `JoinLeftData` and later coordinated by
-/// `SharedBoundsAccumulator` to ensure all partitions contribute their bounds
+/// `SharedBuildAccumulator` to ensure all partitions contribute their bounds
 /// before updating the filter exactly once.
 ///
 /// # Returns
 /// `JoinLeftData` containing the hash map, consolidated batch, join key values,
 /// visited indices bitmap, and computed bounds (if requested).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn collect_left_input(
     random_state: RandomState,
     left_stream: SendableRecordBatchStream,
@@ -1378,7 +1420,9 @@ async fn collect_left_input(
     reservation: MemoryReservation,
     with_visited_indices_bitmap: bool,
     probe_threads_count: usize,
-    should_compute_bounds: bool,
+    should_compute_dynamic_filters: bool,
+    max_inlist_size: usize,
+    max_inlist_distinct_values: usize,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
 
@@ -1390,7 +1434,7 @@ async fn collect_left_input(
         reservation,
         on_left.clone(),
         &schema,
-        should_compute_bounds,
+        should_compute_dynamic_filters,
     )?;
 
     let state = left_stream
@@ -1434,6 +1478,7 @@ async fn collect_left_input(
 
     // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
     // `u64` indice variant
+    // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
     let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
         let estimated_hashtable_size =
             estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
@@ -1469,28 +1514,22 @@ async fn collect_left_input(
         offset += batch.num_rows();
     }
     // Merge all batches into a single batch, so we can directly index into the arrays
-    let single_batch = concat_batches(&schema, batches_iter)?;
+    let batch = concat_batches(&schema, batches_iter)?;
 
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
-        let bitmap_size = bit_util::ceil(single_batch.num_rows(), 8);
+        let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
         reservation.try_grow(bitmap_size)?;
         metrics.build_mem_used.add(bitmap_size);
 
-        let mut bitmap_buffer = BooleanBufferBuilder::new(single_batch.num_rows());
+        let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
         bitmap_buffer.append_n(num_rows, false);
         bitmap_buffer
     } else {
         BooleanBufferBuilder::new(0)
     };
 
-    let left_values = on_left
-        .iter()
-        .map(|c| {
-            c.evaluate(&single_batch)?
-                .into_array(single_batch.num_rows())
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
 
     // Compute bounds for dynamic filter if enabled
     let bounds = match bounds_accumulators {
@@ -1499,20 +1538,47 @@ async fn collect_left_input(
                 .into_iter()
                 .map(CollectLeftAccumulator::evaluate)
                 .collect::<Result<Vec<_>>>()?;
-            Some(bounds)
+            Some(PartitionBounds::new(bounds))
         }
         _ => None,
     };
 
-    let data = JoinLeftData::new(
-        hashmap,
-        single_batch,
-        left_values.clone(),
-        Mutex::new(visited_indices_bitmap),
-        AtomicUsize::new(probe_threads_count),
-        reservation,
+    // Convert Box to Arc for sharing with SharedBuildAccumulator
+    let hash_map: Arc<dyn JoinHashMapType> = hashmap.into();
+
+    let membership = if num_rows == 0 {
+        PushdownStrategy::Empty
+    } else {
+        // If the build side is small enough we can use IN list pushdown.
+        // If it's too big we fall back to pushing down a reference to the hash table.
+        // See `PushdownStrategy` for more details.
+        let estimated_size = left_values
+            .iter()
+            .map(|arr| arr.get_array_memory_size())
+            .sum::<usize>();
+        if left_values.is_empty()
+            || left_values[0].is_empty()
+            || estimated_size > max_inlist_size
+            || hash_map.len() > max_inlist_distinct_values
+        {
+            PushdownStrategy::HashTable(Arc::clone(&hash_map))
+        } else if let Some(in_list_values) = build_struct_inlist_values(&left_values)? {
+            PushdownStrategy::InList(in_list_values)
+        } else {
+            PushdownStrategy::HashTable(Arc::clone(&hash_map))
+        }
+    };
+
+    let data = JoinLeftData {
+        hash_map,
+        batch,
+        values: left_values,
+        visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
+        probe_threads_counter: AtomicUsize::new(probe_threads_count),
+        _reservation: reservation,
         bounds,
-    );
+        membership,
+    };
 
     Ok(data)
 }
@@ -1522,7 +1588,7 @@ mod tests {
     use super::*;
     use crate::coalesce_partitions::CoalescePartitionsExec;
     use crate::joins::hash_join::stream::lookup_join_hashmap;
-    use crate::test::{assert_join_metrics, TestMemoryExec};
+    use crate::test::{TestMemoryExec, assert_join_metrics};
     use crate::{
         common, expressions::Column, repartition::RepartitionExec, test::build_table_i32,
         test::exec::MockExec,
@@ -1535,14 +1601,14 @@ mod tests {
     use datafusion_common::hash_utils::create_hashes;
     use datafusion_common::test_util::{batches_to_sort_string, batches_to_string};
     use datafusion_common::{
-        assert_batches_eq, assert_batches_sorted_eq, assert_contains, exec_err,
-        ScalarValue,
+        ScalarValue, assert_batches_eq, assert_batches_sorted_eq, assert_contains,
+        exec_err, internal_err,
     };
     use datafusion_execution::config::SessionConfig;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_expr::Operator;
-    use datafusion_physical_expr::expressions::{BinaryExpr, Literal};
     use datafusion_physical_expr::PhysicalExpr;
+    use datafusion_physical_expr::expressions::{BinaryExpr, Literal};
     use hashbrown::HashTable;
     use insta::{allow_duplicates, assert_snapshot};
     use rstest::*;
@@ -1671,7 +1737,7 @@ mod tests {
                 Partitioning::Hash(left_expr, partition_count),
             )?),
             PartitionMode::Auto => {
-                return internal_err!("Unexpected PartitionMode::Auto in join tests")
+                return internal_err!("Unexpected PartitionMode::Auto in join tests");
             }
         };
 
@@ -1692,7 +1758,7 @@ mod tests {
                 Partitioning::Hash(right_expr, partition_count),
             )?),
             PartitionMode::Auto => {
-                return internal_err!("Unexpected PartitionMode::Auto in join tests")
+                return internal_err!("Unexpected PartitionMode::Auto in join tests");
             }
         };
 
@@ -1759,15 +1825,15 @@ mod tests {
 
         allow_duplicates! {
             // Inner join output is expected to preserve both inputs order
-            assert_snapshot!(batches_to_string(&batches), @r#"
-                +----+----+----+----+----+----+
-                | a1 | b1 | c1 | a2 | b1 | c2 |
-                +----+----+----+----+----+----+
-                | 1  | 4  | 7  | 10 | 4  | 70 |
-                | 2  | 5  | 8  | 20 | 5  | 80 |
-                | 3  | 5  | 9  | 20 | 5  | 80 |
-                +----+----+----+----+----+----+
-                "#);
+            assert_snapshot!(batches_to_string(&batches), @r"
+            +----+----+----+----+----+----+
+            | a1 | b1 | c1 | a2 | b1 | c2 |
+            +----+----+----+----+----+----+
+            | 1  | 4  | 7  | 10 | 4  | 70 |
+            | 2  | 5  | 8  | 20 | 5  | 80 |
+            | 3  | 5  | 9  | 20 | 5  | 80 |
+            +----+----+----+----+----+----+
+            ");
         }
 
         assert_join_metrics!(metrics, 3);
@@ -1807,15 +1873,15 @@ mod tests {
         assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b1", "c2"]);
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
-                +----+----+----+----+----+----+
-                | a1 | b1 | c1 | a2 | b1 | c2 |
-                +----+----+----+----+----+----+
-                | 1  | 4  | 7  | 10 | 4  | 70 |
-                | 2  | 5  | 8  | 20 | 5  | 80 |
-                | 3  | 5  | 9  | 20 | 5  | 80 |
-                +----+----+----+----+----+----+
-                "#);
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +----+----+----+----+----+----+
+            | a1 | b1 | c1 | a2 | b1 | c2 |
+            +----+----+----+----+----+----+
+            | 1  | 4  | 7  | 10 | 4  | 70 |
+            | 2  | 5  | 8  | 20 | 5  | 80 |
+            | 3  | 5  | 9  | 20 | 5  | 80 |
+            +----+----+----+----+----+----+
+            ");
         }
 
         assert_join_metrics!(metrics, 3);
@@ -1855,7 +1921,7 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r#"
+            assert_snapshot!(batches_to_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b2 | c2 |
             +----+----+----+----+----+----+
@@ -1863,7 +1929,7 @@ mod tests {
             | 2  | 5  | 8  | 20 | 5  | 80 |
             | 3  | 5  | 9  | 20 | 5  | 80 |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
 
         assert_join_metrics!(metrics, 3);
@@ -1903,7 +1969,7 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r#"
+            assert_snapshot!(batches_to_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b2 | c2 |
             +----+----+----+----+----+----+
@@ -1912,7 +1978,7 @@ mod tests {
             | 0  | 4  | 6  | 10 | 4  | 70 |
             | 1  | 4  | 7  | 10 | 4  | 70 |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
 
         assert_join_metrics!(metrics, 4);
@@ -1971,11 +2037,16 @@ mod tests {
             div_ceil(9, batch_size)
         };
 
-        assert_eq!(batches.len(), expected_batch_count);
+        // With batch coalescing, we may have fewer batches than expected
+        assert!(
+            batches.len() <= expected_batch_count,
+            "expected at most {expected_batch_count} batches, got {}",
+            batches.len()
+        );
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r#"
+            assert_snapshot!(batches_to_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b2 | c1 | a1 | b2 | c2 |
             +----+----+----+----+----+----+
@@ -1983,7 +2054,7 @@ mod tests {
             | 2  | 2  | 8  | 2  | 2  | 80 |
             | 2  | 2  | 9  | 2  | 2  | 80 |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
 
         assert_join_metrics!(metrics, 3);
@@ -2051,11 +2122,16 @@ mod tests {
             div_ceil(9, batch_size)
         };
 
-        assert_eq!(batches.len(), expected_batch_count);
+        // With batch coalescing, we may have fewer batches than expected
+        assert!(
+            batches.len() <= expected_batch_count,
+            "expected at most {expected_batch_count} batches, got {}",
+            batches.len()
+        );
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r#"
+            assert_snapshot!(batches_to_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b2 | c1 | a1 | b2 | c2 |
             +----+----+----+----+----+----+
@@ -2063,7 +2139,7 @@ mod tests {
             | 2  | 2  | 8  | 2  | 2  | 80 |
             | 2  | 2  | 9  | 2  | 2  | 80 |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
 
         assert_join_metrics!(metrics, 3);
@@ -2114,7 +2190,7 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r#"
+            assert_snapshot!(batches_to_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b2 | c2 |
             +----+----+----+----+----+----+
@@ -2123,7 +2199,7 @@ mod tests {
             | 0  | 4  | 6  | 10 | 4  | 70 |
             | 1  | 4  | 7  | 10 | 4  | 70 |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
 
         assert_join_metrics!(metrics, 4);
@@ -2187,17 +2263,22 @@ mod tests {
             // and filtered later.
             div_ceil(6, batch_size)
         };
-        assert_eq!(batches.len(), expected_batch_count);
+        // With batch coalescing, we may have fewer batches than expected
+        assert!(
+            batches.len() <= expected_batch_count,
+            "expected at most {expected_batch_count} batches, got {}",
+            batches.len()
+        );
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r#"
+            assert_snapshot!(batches_to_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b1 | c2 |
             +----+----+----+----+----+----+
             | 1  | 4  | 7  | 10 | 4  | 70 |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
 
         // second part
@@ -2212,18 +2293,23 @@ mod tests {
             // and filtered later.
             div_ceil(3, batch_size)
         };
-        assert_eq!(batches.len(), expected_batch_count);
+        // With batch coalescing, we may have fewer batches than expected
+        assert!(
+            batches.len() <= expected_batch_count,
+            "expected at most {expected_batch_count} batches, got {}",
+            batches.len()
+        );
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r#"
+            assert_snapshot!(batches_to_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b1 | c2 |
             +----+----+----+----+----+----+
             | 2  | 5  | 8  | 30 | 5  | 90 |
             | 3  | 5  | 9  | 30 | 5  | 90 |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
 
         Ok(())
@@ -2274,7 +2360,7 @@ mod tests {
         let batches = common::collect(stream).await.unwrap();
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b1 | c2 |
             +----+----+----+----+----+----+
@@ -2284,7 +2370,7 @@ mod tests {
             | 2  | 5  | 8  | 20 | 5  | 80 |
             | 3  | 7  | 9  |    |    |    |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
     }
 
@@ -2324,7 +2410,7 @@ mod tests {
         let batches = common::collect(stream).await.unwrap();
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b2 | c2 |
             +----+----+----+----+----+----+
@@ -2336,7 +2422,7 @@ mod tests {
             | 2  | 5  | 8  | 20 | 5  | 80 |
             | 3  | 7  | 9  |    |    |    |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
     }
 
@@ -2372,7 +2458,7 @@ mod tests {
         let batches = common::collect(stream).await.unwrap();
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b1 | c2 |
             +----+----+----+----+----+----+
@@ -2380,7 +2466,7 @@ mod tests {
             | 2  | 5  | 8  |    |    |    |
             | 3  | 7  | 9  |    |    |    |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
     }
 
@@ -2416,7 +2502,7 @@ mod tests {
         let batches = common::collect(stream).await.unwrap();
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b2 | c2 |
             +----+----+----+----+----+----+
@@ -2424,7 +2510,7 @@ mod tests {
             | 2  | 5  | 8  |    |    |    |
             | 3  | 7  | 9  |    |    |    |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
     }
 
@@ -2460,7 +2546,7 @@ mod tests {
         assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b1", "c2"]);
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b1 | c2 |
             +----+----+----+----+----+----+
@@ -2468,7 +2554,7 @@ mod tests {
             | 2  | 5  | 8  | 20 | 5  | 80 |
             | 3  | 7  | 9  |    |    |    |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
 
         assert_join_metrics!(metrics, 3);
@@ -2508,7 +2594,7 @@ mod tests {
         assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b1", "c2"]);
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b1 | c2 |
             +----+----+----+----+----+----+
@@ -2516,7 +2602,7 @@ mod tests {
             | 2  | 5  | 8  | 20 | 5  | 80 |
             | 3  | 7  | 9  |    |    |    |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
 
         assert_join_metrics!(metrics, 3);
@@ -2572,7 +2658,7 @@ mod tests {
 
         // ignore the order
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+-----+
             | a1 | b1 | c1  |
             +----+----+-----+
@@ -2580,7 +2666,7 @@ mod tests {
             | 13 | 10 | 130 |
             | 9  | 8  | 90  |
             +----+----+-----+
-                "#);
+            ");
         }
 
         Ok(())
@@ -2673,13 +2759,13 @@ mod tests {
         let batches = common::collect(stream).await?;
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+-----+
             | a1 | b1 | c1  |
             +----+----+-----+
             | 13 | 10 | 130 |
             +----+----+-----+
-                "#);
+            ");
         }
 
         Ok(())
@@ -2714,7 +2800,7 @@ mod tests {
 
         // RightSemi join output is expected to preserve right input order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r#"
+            assert_snapshot!(batches_to_string(&batches), @r"
             +----+----+-----+
             | a2 | b2 | c2  |
             +----+----+-----+
@@ -2722,7 +2808,7 @@ mod tests {
             | 12 | 10 | 40  |
             | 10 | 10 | 100 |
             +----+----+-----+
-                "#);
+            ");
         }
 
         Ok(())
@@ -2777,7 +2863,7 @@ mod tests {
 
         // RightSemi join output is expected to preserve right input order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r#"
+            assert_snapshot!(batches_to_string(&batches), @r"
             +----+----+-----+
             | a2 | b2 | c2  |
             +----+----+-----+
@@ -2785,7 +2871,7 @@ mod tests {
             | 12 | 10 | 40  |
             | 10 | 10 | 100 |
             +----+----+-----+
-                "#);
+            ");
         }
 
         // left_table right semi join right_table on left_table.b1 = right_table.b2 on left_table.a1!=9
@@ -2814,14 +2900,14 @@ mod tests {
 
         // RightSemi join output is expected to preserve right input order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r#"
+            assert_snapshot!(batches_to_string(&batches), @r"
             +----+----+-----+
             | a2 | b2 | c2  |
             +----+----+-----+
             | 12 | 10 | 40  |
             | 10 | 10 | 100 |
             +----+----+-----+
-                "#);
+            ");
         }
 
         Ok(())
@@ -2854,7 +2940,7 @@ mod tests {
         let batches = common::collect(stream).await?;
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+
             | a1 | b1 | c1 |
             +----+----+----+
@@ -2863,7 +2949,7 @@ mod tests {
             | 5  | 5  | 50 |
             | 7  | 7  | 70 |
             +----+----+----+
-                "#);
+            ");
         }
         Ok(())
     }
@@ -2914,7 +3000,7 @@ mod tests {
         let batches = common::collect(stream).await?;
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+-----+
             | a1 | b1 | c1  |
             +----+----+-----+
@@ -2925,7 +3011,7 @@ mod tests {
             | 7  | 7  | 70  |
             | 9  | 8  | 90  |
             +----+----+-----+
-                "#);
+            ");
         }
 
         // left_table left anti join right_table on left_table.b1 = right_table.b2 and right_table.a2 != 13
@@ -2957,7 +3043,7 @@ mod tests {
         let batches = common::collect(stream).await?;
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+-----+
             | a1 | b1 | c1  |
             +----+----+-----+
@@ -2968,7 +3054,7 @@ mod tests {
             | 7  | 7  | 70  |
             | 9  | 8  | 90  |
             +----+----+-----+
-                "#);
+            ");
         }
 
         Ok(())
@@ -3001,7 +3087,7 @@ mod tests {
 
         // RightAnti join output is expected to preserve right input order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r#"
+            assert_snapshot!(batches_to_string(&batches), @r"
             +----+----+-----+
             | a2 | b2 | c2  |
             +----+----+-----+
@@ -3009,7 +3095,7 @@ mod tests {
             | 2  | 2  | 80  |
             | 4  | 4  | 120 |
             +----+----+-----+
-                "#);
+            ");
         }
         Ok(())
     }
@@ -3062,7 +3148,7 @@ mod tests {
 
         // RightAnti join output is expected to preserve right input order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r#"
+            assert_snapshot!(batches_to_string(&batches), @r"
             +----+----+-----+
             | a2 | b2 | c2  |
             +----+----+-----+
@@ -3072,7 +3158,7 @@ mod tests {
             | 10 | 10 | 100 |
             | 4  | 4  | 120 |
             +----+----+-----+
-                "#);
+            ");
         }
 
         // left_table right anti join right_table on left_table.b1 = right_table.b2 and right_table.b2!=8
@@ -3109,7 +3195,7 @@ mod tests {
 
         // RightAnti join output is expected to preserve right input order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r#"
+            assert_snapshot!(batches_to_string(&batches), @r"
             +----+----+-----+
             | a2 | b2 | c2  |
             +----+----+-----+
@@ -3118,7 +3204,7 @@ mod tests {
             | 2  | 2  | 80  |
             | 4  | 4  | 120 |
             +----+----+-----+
-                "#);
+            ");
         }
 
         Ok(())
@@ -3156,7 +3242,7 @@ mod tests {
         assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b1", "c2"]);
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b1 | c2 |
             +----+----+----+----+----+----+
@@ -3164,7 +3250,7 @@ mod tests {
             | 1  | 4  | 7  | 10 | 4  | 70 |
             | 2  | 5  | 8  | 20 | 5  | 80 |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
 
         assert_join_metrics!(metrics, 3);
@@ -3204,7 +3290,7 @@ mod tests {
         assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b1", "c2"]);
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b1 | c2 |
             +----+----+----+----+----+----+
@@ -3212,7 +3298,7 @@ mod tests {
             | 1  | 4  | 7  | 10 | 4  | 70 |
             | 2  | 5  | 8  | 20 | 5  | 80 |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
 
         assert_join_metrics!(metrics, 3);
@@ -3254,7 +3340,7 @@ mod tests {
         let batches = common::collect(stream).await?;
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b2 | c2 |
             +----+----+----+----+----+----+
@@ -3263,7 +3349,7 @@ mod tests {
             | 2  | 5  | 8  | 20 | 5  | 80 |
             | 3  | 7  | 9  |    |    |    |
             +----+----+----+----+----+----+
-                "#);
+            ");
         }
 
         Ok(())
@@ -3301,7 +3387,7 @@ mod tests {
         assert_eq!(columns, vec!["a1", "b1", "c1", "mark"]);
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+-------+
             | a1 | b1 | c1 | mark  |
             +----+----+----+-------+
@@ -3309,7 +3395,7 @@ mod tests {
             | 2  | 5  | 8  | true  |
             | 3  | 7  | 9  | false |
             +----+----+----+-------+
-                "#);
+            ");
         }
 
         assert_join_metrics!(metrics, 3);
@@ -3349,7 +3435,7 @@ mod tests {
         assert_eq!(columns, vec!["a1", "b1", "c1", "mark"]);
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+-------+
             | a1 | b1 | c1 | mark  |
             +----+----+----+-------+
@@ -3357,7 +3443,7 @@ mod tests {
             | 2  | 5  | 8  | true  |
             | 3  | 7  | 9  | false |
             +----+----+----+-------+
-                "#);
+            ");
         }
 
         assert_join_metrics!(metrics, 3);
@@ -3502,6 +3588,8 @@ mod tests {
         let mut hashes_buffer = vec![0; right.num_rows()];
         create_hashes([&right_keys_values], &random_state, &mut hashes_buffer)?;
 
+        let mut probe_indices_buffer = Vec::new();
+        let mut build_indices_buffer = Vec::new();
         let (l, r, _) = lookup_join_hashmap(
             &join_hash_map,
             &[left_keys_values],
@@ -3510,6 +3598,8 @@ mod tests {
             &hashes_buffer,
             8192,
             (0, None),
+            &mut probe_indices_buffer,
+            &mut build_indices_buffer,
         )?;
 
         let left_ids: UInt64Array = vec![0, 1].into();
@@ -3559,6 +3649,8 @@ mod tests {
         let mut hashes_buffer = vec![0; right.num_rows()];
         create_hashes([&right_keys_values], &random_state, &mut hashes_buffer)?;
 
+        let mut probe_indices_buffer = Vec::new();
+        let mut build_indices_buffer = Vec::new();
         let (l, r, _) = lookup_join_hashmap(
             &join_hash_map,
             &[left_keys_values],
@@ -3567,6 +3659,8 @@ mod tests {
             &hashes_buffer,
             8192,
             (0, None),
+            &mut probe_indices_buffer,
+            &mut build_indices_buffer,
         )?;
 
         // We still expect to match rows 0 and 1 on both sides
@@ -3613,14 +3707,14 @@ mod tests {
         let batches = common::collect(stream).await?;
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +---+---+---+----+---+----+
             | a | b | c | a  | b | c  |
             +---+---+---+----+---+----+
             | 1 | 4 | 7 | 10 | 1 | 70 |
             | 2 | 5 | 8 | 20 | 2 | 80 |
             +---+---+---+----+---+----+
-                "#);
+            ");
         }
 
         Ok(())
@@ -3690,14 +3784,14 @@ mod tests {
         let batches = common::collect(stream).await?;
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +---+---+---+----+---+---+
             | a | b | c | a  | b | c |
             +---+---+---+----+---+---+
             | 2 | 7 | 9 | 10 | 2 | 7 |
             | 2 | 7 | 9 | 20 | 2 | 5 |
             +---+---+---+----+---+---+
-                "#);
+            ");
         }
 
         Ok(())
@@ -3739,7 +3833,7 @@ mod tests {
         let batches = common::collect(stream).await?;
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +---+---+---+----+---+---+
             | a | b | c | a  | b | c |
             +---+---+---+----+---+---+
@@ -3749,7 +3843,7 @@ mod tests {
             | 2 | 7 | 9 | 20 | 2 | 5 |
             | 2 | 8 | 1 |    |   |   |
             +---+---+---+----+---+---+
-                "#);
+            ");
         }
 
         Ok(())
@@ -3791,7 +3885,7 @@ mod tests {
         let batches = common::collect(stream).await?;
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +---+---+---+----+---+---+
             | a | b | c | a  | b | c |
             +---+---+---+----+---+---+
@@ -3800,7 +3894,7 @@ mod tests {
             | 2 | 7 | 9 | 10 | 2 | 7 |
             | 2 | 7 | 9 | 20 | 2 | 5 |
             +---+---+---+----+---+---+
-                "#);
+            ");
         }
 
         Ok(())
@@ -4046,7 +4140,7 @@ mod tests {
         let batches = common::collect(stream).await?;
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +------------+---+------------+---+
             | date       | n | date       | n |
             +------------+---+------------+---+
@@ -4054,7 +4148,7 @@ mod tests {
             | 2022-04-26 | 2 | 2022-04-26 | 5 |
             | 2022-04-27 | 3 | 2022-04-27 | 6 |
             +------------+---+------------+---+
-                "#);
+            ");
         }
 
         Ok(())
@@ -4232,10 +4326,11 @@ mod tests {
                     }
                     _ => div_ceil(expected_resultset_records, batch_size) + 1,
                 };
-                assert_eq!(
-                    batches.len(),
-                    expected_batch_count,
-                    "expected {expected_batch_count} output batches for {join_type} join with batch_size = {batch_size}"
+                // With batch coalescing, we may have fewer batches than expected
+                assert!(
+                    batches.len() <= expected_batch_count,
+                    "expected at most {expected_batch_count} output batches for {join_type} join with batch_size = {batch_size}, got {}",
+                    batches.len()
                 );
 
                 let expected = match join_type {
@@ -4245,7 +4340,17 @@ mod tests {
                     JoinType::LeftAnti => left_empty.to_vec(),
                     _ => common_result.to_vec(),
                 };
-                assert_batches_eq!(expected, &batches);
+                // For anti joins with empty results, we may get zero batches
+                // (with coalescing) instead of one empty batch with schema
+                if batches.is_empty() {
+                    // Verify this is an expected empty result case
+                    assert!(
+                        matches!(join_type, JoinType::RightAnti | JoinType::LeftAnti),
+                        "Unexpected empty result for {join_type} join"
+                    );
+                } else {
+                    assert_batches_eq!(expected, &batches);
+                }
             }
         }
     }
@@ -4383,7 +4488,6 @@ mod tests {
             assert_contains!(
                 err.to_string(),
                 "Resources exhausted: Additional allocation failed for HashJoinInput[1] with top memory consumers (across reservations) as:\n  HashJoinInput[1]"
-
             );
 
             assert_contains!(
@@ -4446,7 +4550,7 @@ mod tests {
         assert_eq!(columns, vec!["n1", "n2"]);
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r#"
+            assert_snapshot!(batches_to_string(&batches), @r"
             +--------+--------+
             | n1     | n2     |
             +--------+--------+
@@ -4454,7 +4558,7 @@ mod tests {
             | {a: 1} | {a: 1} |
             | {a: 2} | {a: 2} |
             +--------+--------+
-                "#);
+            ");
         }
 
         assert_join_metrics!(metrics, 3);
@@ -4485,13 +4589,13 @@ mod tests {
         .await?;
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_sort_string(&batches_null_eq), @r#"
+            assert_snapshot!(batches_to_sort_string(&batches_null_eq), @r"
             +----+----+
             | n1 | n2 |
             +----+----+
             |    |    |
             +----+----+
-                "#);
+            ");
         }
 
         assert_join_metrics!(metrics, 1);
@@ -4508,9 +4612,15 @@ mod tests {
 
         assert_join_metrics!(metrics, 0);
 
-        let expected_null_neq =
-            ["+----+----+", "| n1 | n2 |", "+----+----+", "+----+----+"];
-        assert_batches_eq!(expected_null_neq, &batches_null_neq);
+        // With batch coalescing, empty results may not emit any batches
+        // Check that either we have no batches, or an empty batch with proper schema
+        if batches_null_neq.is_empty() {
+            // This is fine - no output rows
+        } else {
+            let expected_null_neq =
+                ["+----+----+", "| n1 | n2 |", "+----+----+", "+----+----+"];
+            assert_batches_eq!(expected_null_neq, &batches_null_neq);
+        }
 
         Ok(())
     }
@@ -4518,5 +4628,114 @@ mod tests {
     /// Returns the column names on the schema
     fn columns(schema: &Schema) -> Vec<String> {
         schema.fields().iter().map(|f| f.name().clone()).collect()
+    }
+
+    /// This test verifies that the dynamic filter is marked as complete after HashJoinExec finishes building the hash table.
+    #[tokio::test]
+    async fn test_hash_join_marks_filter_complete() -> Result<()> {
+        let task_ctx = Arc::new(TaskContext::default());
+        let left = build_table(
+            ("a1", &vec![1, 2, 3]),
+            ("b1", &vec![4, 5, 6]),
+            ("c1", &vec![7, 8, 9]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20, 30]),
+            ("b1", &vec![4, 5, 6]),
+            ("c2", &vec![70, 80, 90]),
+        );
+
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        // Create a dynamic filter manually
+        let dynamic_filter = HashJoinExec::create_dynamic_filter(&on);
+        let dynamic_filter_clone = Arc::clone(&dynamic_filter);
+
+        // Simulate a consumer by creating a transformed copy (what happens during filter pushdown)
+        let _consumer = Arc::clone(&dynamic_filter)
+            .with_new_children(vec![])
+            .unwrap();
+
+        // Create HashJoinExec with the dynamic filter
+        let mut join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+        )?;
+        join.dynamic_filter = Some(HashJoinExecDynamicFilter {
+            filter: dynamic_filter,
+            build_accumulator: OnceLock::new(),
+        });
+
+        // Execute the join
+        let stream = join.execute(0, task_ctx)?;
+        let _batches = common::collect(stream).await?;
+
+        // After the join completes, the dynamic filter should be marked as complete
+        // wait_complete() should return immediately
+        dynamic_filter_clone.wait_complete().await;
+
+        Ok(())
+    }
+
+    /// This test verifies that the dynamic filter is marked as complete even when the build side is empty.
+    #[tokio::test]
+    async fn test_hash_join_marks_filter_complete_empty_build_side() -> Result<()> {
+        let task_ctx = Arc::new(TaskContext::default());
+        // Empty left side (build side)
+        let left = build_table(("a1", &vec![]), ("b1", &vec![]), ("c1", &vec![]));
+        let right = build_table(
+            ("a2", &vec![10, 20, 30]),
+            ("b1", &vec![4, 5, 6]),
+            ("c2", &vec![70, 80, 90]),
+        );
+
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        // Create a dynamic filter manually
+        let dynamic_filter = HashJoinExec::create_dynamic_filter(&on);
+        let dynamic_filter_clone = Arc::clone(&dynamic_filter);
+
+        // Simulate a consumer by creating a transformed copy (what happens during filter pushdown)
+        let _consumer = Arc::clone(&dynamic_filter)
+            .with_new_children(vec![])
+            .unwrap();
+
+        // Create HashJoinExec with the dynamic filter
+        let mut join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+        )?;
+        join.dynamic_filter = Some(HashJoinExecDynamicFilter {
+            filter: dynamic_filter,
+            build_accumulator: OnceLock::new(),
+        });
+
+        // Execute the join
+        let stream = join.execute(0, task_ctx)?;
+        let _batches = common::collect(stream).await?;
+
+        // Even with empty build side, the dynamic filter should be marked as complete
+        // wait_complete() should return immediately
+        dynamic_filter_clone.wait_complete().await;
+
+        Ok(())
     }
 }
