@@ -2926,19 +2926,23 @@ impl DefaultPhysicalPlanner {
                 .map_err(|e| {
                     DataFusionError::Context(optimizer.name().to_string(), Box::new(e))
                 })?;
+            // `pending` is always `Some` here: a call that reaches this
+            // point was not skipped, so the lookup rendered its input. What
+            // gets recorded is the *output* object, the one that continues
+            // down the chain, so a later call handing it back hits the
+            // pointer tier without rendering anything.
             if optimizer.deterministic() {
-                let unchanged = Arc::ptr_eq(&input, &new_plan)
-                    || pending.as_ref().is_some_and(|(_, rendered)| {
-                        plan_fingerprint(new_plan.as_ref()) == *rendered
-                    });
-                if unchanged {
-                    let (plan, rendered) = pending.unwrap_or_else(|| {
-                        (Arc::clone(&input), plan_fingerprint(input.as_ref()))
-                    });
-                    fixpoints
-                        .entry(optimizer.name())
-                        .or_default()
-                        .push((plan, rendered));
+                let recorded = if Arc::ptr_eq(&input, &new_plan) {
+                    pending.map(|(_, rendered)| (Arc::clone(&new_plan), rendered))
+                } else {
+                    pending.and_then(|(_, rendered)| {
+                        let output_rendered = plan_fingerprint(new_plan.as_ref());
+                        (output_rendered == rendered)
+                            .then(|| (Arc::clone(&new_plan), output_rendered))
+                    })
+                };
+                if let Some(entry) = recorded {
+                    fixpoints.entry(optimizer.name()).or_default().push(entry);
                 }
             }
 
