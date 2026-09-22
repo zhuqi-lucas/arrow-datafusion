@@ -81,4 +81,18 @@ pub trait PhysicalOptimizerRule: Debug + std::any::Any {
     /// Some of the optimization rules might change the nullable properties of the schema
     /// and should disable the schema check.
     fn schema_check(&self) -> bool;
+
+    /// Whether this rule's output is a pure function of the plan and the
+    /// configuration: no clocks, no randomness, no external mutable state.
+    ///
+    /// Within one optimization run, once a deterministic rule has been
+    /// *observed* to return a plan unchanged, a later call handing it that
+    /// same plan is skipped outright, since it would provably do the same
+    /// nothing. Nothing is ever re-applied speculatively, so this is safe
+    /// for rules that are not idempotent: a rule that oscillates between two
+    /// forms is deterministic, never records a fixpoint, and is simply never
+    /// skipped. Wrappers must delegate this, or the skip silently dies.
+    fn deterministic(&self) -> bool {
+        false
+    }
 }

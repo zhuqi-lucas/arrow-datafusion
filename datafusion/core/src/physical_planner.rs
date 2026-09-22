@@ -100,6 +100,7 @@ use datafusion_physical_expr::expressions::Literal;
 use datafusion_physical_expr::{
     LexOrdering, PhysicalSortExpr, create_physical_sort_exprs,
 };
+use datafusion_physical_optimizer::plan_signature::plan_fingerprint;
 use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::execution_plan::InvariantLevel;
 use datafusion_physical_plan::joins::PiecewiseMergeJoinExec;
@@ -2890,13 +2891,56 @@ impl DefaultPhysicalPlanner {
         let optimizer_context = SessionOptimizerContext {
             session: session_state,
         };
+        // Plans each deterministic rule has been observed to leave unchanged
+        // in this run, so a later call handing one back can be skipped. Full
+        // fingerprints, not hashes: a collision would skip an enforcement
+        // pass that had work to do.
+        type ObservedFixpoint = (Arc<dyn ExecutionPlan>, String);
+        let mut fixpoints: HashMap<&str, Vec<ObservedFixpoint>> = HashMap::new();
         for optimizer in optimizers {
+            let mut pending: Option<ObservedFixpoint> = None;
+            if optimizer.deterministic() {
+                let known = fixpoints.get(optimizer.name());
+                let same_object = known.is_some_and(|entries| {
+                    entries.iter().any(|(plan, _)| Arc::ptr_eq(plan, &new_plan))
+                });
+                let fingerprint =
+                    (!same_object).then(|| plan_fingerprint(new_plan.as_ref()));
+                let same_content = fingerprint.as_ref().is_some_and(|rendered| {
+                    known.is_some_and(|entries| {
+                        entries.iter().any(|(_, seen)| seen == rendered)
+                    })
+                });
+                if same_object || same_content {
+                    observer(new_plan.as_ref(), optimizer.as_ref());
+                    continue;
+                }
+                if let Some(rendered) = fingerprint {
+                    pending = Some((Arc::clone(&new_plan), rendered));
+                }
+            }
+            let input = Arc::clone(&new_plan);
             let before_schema = new_plan.schema();
             new_plan = optimizer
                 .optimize_with_context(new_plan, &optimizer_context)
                 .map_err(|e| {
                     DataFusionError::Context(optimizer.name().to_string(), Box::new(e))
                 })?;
+            if optimizer.deterministic() {
+                let unchanged = Arc::ptr_eq(&input, &new_plan)
+                    || pending.as_ref().is_some_and(|(_, rendered)| {
+                        plan_fingerprint(new_plan.as_ref()) == *rendered
+                    });
+                if unchanged {
+                    let (plan, rendered) = pending.unwrap_or_else(|| {
+                        (Arc::clone(&input), plan_fingerprint(input.as_ref()))
+                    });
+                    fixpoints
+                        .entry(optimizer.name())
+                        .or_default()
+                        .push((plan, rendered));
+                }
+            }
 
             // This only checks the schema in release build, and performs additional checks in debug mode.
             OptimizationInvariantChecker::new(optimizer)

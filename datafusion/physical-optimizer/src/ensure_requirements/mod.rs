@@ -251,6 +251,14 @@ impl PhysicalOptimizerRule for EnsureRequirements {
         "EnsureRequirements"
     }
 
+    /// The rule reads nothing but the plan and the session configuration, so
+    /// a call handing it a plan it has been observed to leave unchanged can
+    /// be skipped. Safe even though the rule is not idempotent: an observed
+    /// fixpoint is replayed, never predicted.
+    fn deterministic(&self) -> bool {
+        true
+    }
+
     fn schema_check(&self) -> bool {
         true
     }
